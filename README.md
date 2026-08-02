@@ -28,20 +28,9 @@ Every response carries a `metadata.fetched_at` timestamp and an `is_cached: fals
 
 ## How it works
 
-```
-  your agent
-      |
-      |  MCP over stdio
-      v
-  ExcelMCP server
-      |
-      +--> graph.json      structure only, read instantly, no network
-      |
-      +--> vectors.npy     embedded sheet descriptions, for routing questions
-      |
-      +--> Microsoft Graph ------> OneDrive
-                                   every cell value, fetched on demand
-```
+<p align="center">
+  <img src="docs/architecture.png" alt="Your agent talks to the ExcelMCP server over MCP stdio. The server reads graph.json for structure with no network, vectors.npy for embedded sheet descriptions used to route questions, and the Microsoft Graph API for every cell value, fetched on demand from OneDrive." width="820">
+</p>
 
 A natural language question gets embedded, matched against the sheet descriptions by cosine similarity, and routed to the sheets most likely to hold the answer. Those sheets, and only those, get fetched live. Filtering and aggregation then happen in pandas on the freshly fetched frame.
 
@@ -212,6 +201,20 @@ cross_file_aggregate(
 
 ---
 
+## Agent playbook
+
+Getting the server installed is the easy half. The [agents/](agents/) folder covers the other half: how to prompt an agent that has these tools, how to wire it into each host, and what to automate once it works.
+
+| | |
+|---|---|
+| [agents/system-prompt.md](agents/system-prompt.md) | A drop-in system prompt for custom agents, subagents, `CLAUDE.md`, or Cursor rules. Full and trimmed versions, plus a template for pinning down your own workspace's quirks. |
+| [agents/prompts.md](agents/prompts.md) | Copy-paste prompts sorted by job: orientation, straight answers, analysis, verification, reporting, data quality. Ends with a set of anti-prompts, the reasonable-looking phrasings that reliably produce wrong answers. |
+| [agents/guides/getting-started.md](agents/guides/getting-started.md) | A first session that proves the chain works end to end, including how to verify for yourself that the data really is live. |
+| [agents/guides/hosts.md](agents/guides/hosts.md) | What gets written to each of the twelve supported host configs, how to verify it, per-host quirks, and how to drive the server programmatically with no host at all. |
+| [agents/guides/query-patterns.md](agents/guides/query-patterns.md) | Which tool to reach for, how semantic routing actually picks a sheet, what the condition syntax cannot express, and the data shapes that produce confident wrong answers. |
+| [agents/guides/troubleshooting.md](agents/guides/troubleshooting.md) | Symptoms decoded, from PATH problems and 403s through to garbled column names and totals that come out double. |
+| [agents/routines/](agents/routines/) | Four ready-to-schedule routines: daily inventory check, weekly sales digest, month-end reconciliation, data quality audit. Each with the prompt, the scheduling, and what tends to go wrong. |
+
 ## Guardrails built into the server
 
 The server ships a set of operating rules in its MCP instructions, which the host model reads before it makes its first call. They exist because these are the specific ways an LLM gets spreadsheet questions wrong:
@@ -222,6 +225,8 @@ The server ships a set of operating rules in its MCP instructions, which the hos
 - Never sum a quantity column in transaction-style data without filtering by transaction type first.
 - Treat numeric dates as Excel serials, offset from 1899-12-30.
 - Check the `truncated` and `total_matched` fields before claiming a result is complete.
+
+Hosts that ignore server instructions, and custom agents you build yourself, need this stated in their own prompt. See [agents/system-prompt.md](agents/system-prompt.md).
 
 ---
 
@@ -270,6 +275,7 @@ The integration suite skips itself when `EXCELMCP_TEST_FOLDER` is unset, so a pl
 ## Project layout
 
 ```
+agents/           prompts, host guides, and schedulable routines
 auth.py           MSAL device flow, token cache, proactive refresh
 graph_client.py   Graph API wrapper, 429 backoff, session reuse
 structure.py      Structure discovery, writes graph.json
