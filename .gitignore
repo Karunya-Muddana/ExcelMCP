@@ -1,0 +1,22 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Tooling caches
+.pytest_cache/
+.claude/
+
+# Credentials and local state — never commit these
+.env
+token.json
+graph.json
+vectors.npy
+metadata.json
+.excelmcp/

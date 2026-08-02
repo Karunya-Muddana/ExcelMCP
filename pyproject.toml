@@ -1,0 +1,66 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "excelmcp"
+version = "0.1.0"
+description = "Universal live Excel intelligence layer for AI agents via Microsoft Graph API"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Karun Muddan", email = "kmuddan2@student.gitam.edu" }]
+keywords = ["mcp", "excel", "onedrive", "microsoft-graph", "llm", "agents"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Office/Business :: Financial :: Spreadsheet",
+]
+# hnswlib was removed here deliberately: it publishes no binary wheels, so
+# `pip install excelmcp` failed on any machine without a C++ toolchain. Ranking
+# now uses a NumPy cosine scan (see embeddings.py), which needs no build step.
+dependencies = [
+    "aiohttp>=3.14.1",
+    "fastembed>=0.8.0",
+    "fastmcp>=3.4.2",
+    "msal>=1.37.0",
+    "numpy>=1.24.0",
+    "pandas>=2.3.3",
+    # CLI rendering and agent-config editing. These were previously reached only
+    # as transitive deps of fastmcp, which meant a fastmcp release could silently
+    # break the wizard. Declared explicitly.
+    "rich>=13.0",
+    "pyyaml>=6.0",
+    # tomllib is stdlib from 3.11; 3.10 needs the backport to read Codex's config.
+    "tomli>=2.0; python_version < '3.11'",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.24"]
+
+[project.scripts]
+excelmcp = "excelmcp.main:main"
+excelmcp-setup = "excelmcp.cli:main"
+
+[project.urls]
+Repository = "https://github.com/karunmuddan/excelmcp"
+Issues = "https://github.com/karunmuddan/excelmcp/issues"
+
+[tool.setuptools]
+packages = ["excelmcp"]
+
+[tool.setuptools.package-dir]
+excelmcp = "."
+
+[tool.setuptools.package-data]
+excelmcp = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
