@@ -49,8 +49,8 @@ excelmcp = "excelmcp.main:main"
 excelmcp-setup = "excelmcp.cli:main"
 
 [project.urls]
-Repository = "https://github.com/karunmuddan/excelmcp"
-Issues = "https://github.com/karunmuddan/excelmcp/issues"
+Repository = "https://github.com/Karunya-Muddana/ExcelMCP"
+Issues = "https://github.com/Karunya-Muddana/ExcelMCP/issues"
 
 [tool.setuptools]
 packages = ["excelmcp"]
