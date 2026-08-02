@@ -67,6 +67,25 @@ The token cache lives at `~/.excelmcp/token.json`. Refresh tokens expire, and te
 excelmcp-setup
 ```
 
+### The browser says "All done!" but the CLI says the code was already used
+
+```
+AADSTS70000: The provided value for the input parameter 'device_code'
+has already been used.
+```
+
+Your sign-in worked. The failure is on the other leg.
+
+In device code flow the browser submits the short user code, and this machine separately submits the long device code to the token endpoint to collect the tokens. That device code is single use, and nothing but this client ever redeems it. So "already used" means our own poll redeemed it twice: the first response carried the tokens but was lost in transit, MSAL treated the dropped response as retryable, and the retry arrived at a spent code. Hence the split verdict, success in the browser and failure in the terminal.
+
+It is a dropped response, not a credential problem. The wizard now starts a fresh code automatically when it sees this, up to three attempts, so a single hiccup is invisible. If it fails all three, the connection to `login.microsoftonline.com` is dropping responses consistently rather than occasionally. That is most common under WSL and behind corporate proxies or TLS-inspecting middleboxes.
+
+Things that help, roughly in order:
+
+- Run the wizard again. One bad response is usually just one bad response.
+- Try from the Windows host rather than inside WSL, then copy `~/.excelmcp/token.json` into the WSL home directory if you need it there. The file is portable.
+- If you are on a VPN or corporate network, try off it. TLS inspection on the token endpoint is a common cause.
+
 ### Access denied (403)
 
 The message names the missing permission. ExcelMCP requests `Files.Read.All`, and in a managed tenant an administrator may need to consent to it before device-code sign in will grant it. This is a tenant policy question, not a bug: take the app registration and the scope to whoever administers your Microsoft 365.

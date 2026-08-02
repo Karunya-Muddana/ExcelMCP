@@ -3,6 +3,7 @@ import base64
 import json
 import os
 import time
+from typing import Any, Callable, Optional
 
 import msal
 
@@ -10,6 +11,14 @@ from excelmcp.storage import atomic_write_text, get_config_dir
 
 SCOPES = ["Files.Read.All"]
 _PROACTIVE_REFRESH_SECONDS = 600  # refresh if token expires within 10 minutes
+
+# A device code is single-use at the token endpoint, and only this client ever
+# redeems it. So "already been used" (AADSTS70000) means our own poll redeemed it
+# twice: the first response carried the tokens but was lost in transit, MSAL
+# treated the dropped response as retryable, and the retry hit a spent code. The
+# user sees "All done!" in the browser while the CLI reports a hard failure.
+# The code is gone either way, so the only recovery is a fresh flow.
+_DEVICE_FLOW_ATTEMPTS = 3
 
 # Public client ID for the ExcelMCP app registration. This is not a secret —
 # device-code flow uses a public client with no client secret, and the value is
@@ -54,7 +63,101 @@ def _persist(cache: msal.SerializableTokenCache) -> None:
         print(f"[Auth] Warning: could not save token cache: {exc}")
 
 
-async def get_token(force_refresh: bool = False) -> str:
+def _is_spent_code(result: dict) -> bool:
+    """True when the device code was consumed before our poll could read the tokens."""
+    description = (result.get("error_description") or "").lower()
+    return "aadsts70000" in description or "has already been used" in description
+
+
+def _is_expired_code(result: dict) -> bool:
+    """True when the code timed out before the user finished signing in."""
+    description = (result.get("error_description") or "").lower()
+    return result.get("error") == "expired_token" or "aadsts70019" in description
+
+
+def _print_device_code(flow: dict) -> None:
+    print(
+        f"\nGo to {flow.get('verification_uri', 'https://microsoft.com/devicelogin')} "
+        f"and enter code: {flow['user_code']}\n",
+        flush=True,
+    )
+
+
+async def _run_device_flow(
+    app: msal.PublicClientApplication,
+    cache: msal.SerializableTokenCache,
+    on_device_code: Optional[Callable[[dict], None]],
+) -> dict:
+    """Runs device-code auth, starting a fresh flow if a code is spent or expires."""
+    announce = on_device_code or _print_device_code
+    last: dict[str, Any] = {}
+
+    for attempt in range(1, _DEVICE_FLOW_ATTEMPTS + 1):
+        flow = await asyncio.to_thread(app.initiate_device_flow, scopes=SCOPES)
+        if "user_code" not in flow:
+            raise RuntimeError(
+                f"Could not start device sign-in: {flow.get('error')} "
+                f"- {flow.get('error_description')}"
+            )
+
+        announce(flow)
+        last = await asyncio.to_thread(app.acquire_token_by_device_flow, flow)
+
+        if "access_token" in last:
+            return last
+
+        # MSAL may have cached tokens even on a path that reported failure.
+        _persist(cache)
+
+        if attempt == _DEVICE_FLOW_ATTEMPTS:
+            break
+
+        if _is_spent_code(last):
+            print(
+                "[Auth] The sign-in completed but the confirmation did not reach us, "
+                "so that code is now spent. Starting a new one.",
+                flush=True,
+            )
+            continue
+
+        if _is_expired_code(last):
+            print("[Auth] That code expired before sign-in finished. Here is a new one.", flush=True)
+            continue
+
+        break
+
+    raise RuntimeError(_device_flow_message(last))
+
+
+def _device_flow_message(result: dict) -> str:
+    error = result.get("error")
+    description = result.get("error_description") or ""
+
+    if _is_spent_code(result):
+        return (
+            "Sign-in kept failing at the last step. Microsoft accepted your login "
+            "but the token never reached this machine, which usually means a flaky "
+            "or filtered connection to login.microsoftonline.com. This is common "
+            "under WSL and behind corporate proxies. Try again on a stable "
+            "connection, or run the wizard from the Windows host rather than WSL."
+        )
+    if _is_expired_code(result):
+        return "The device code expired before sign-in finished. Run the command again."
+    if error == "authorization_declined":
+        return "Sign-in was declined in the browser. Run the command again to retry."
+    if "AADSTS65004" in description:
+        return (
+            "Consent was not granted. ExcelMCP needs the Files.Read.All permission "
+            "to read your workbooks. In a managed tenant an administrator may need "
+            "to approve it first."
+        )
+    return f"Authentication failed: {error} - {description}"
+
+
+async def get_token(
+    force_refresh: bool = False,
+    on_device_code: Optional[Callable[[dict], None]] = None,
+) -> str:
     client_id, authority = get_auth_config()
 
     cache = msal.SerializableTokenCache()
@@ -87,22 +190,7 @@ async def get_token(force_refresh: bool = False) -> str:
             _persist(cache)
             return result["access_token"]
 
-    flow = app.initiate_device_flow(scopes=SCOPES)
-    if "user_code" not in flow:
-        raise ValueError(f"Failed to create device flow: {flow.get('error')}")
-
-    print(
-        f"\nGo to https://microsoft.com/devicelogin and enter code: {flow['user_code']}\n",
-        flush=True,
-    )
-
-    result = await asyncio.to_thread(app.acquire_token_by_device_flow, flow)
-
-    if "access_token" in result:
-        _persist(cache)
-        print("[Auth] Authenticated successfully.", flush=True)
-        return result["access_token"]
-
-    raise RuntimeError(
-        f"Authentication failed: {result.get('error')} - {result.get('error_description')}"
-    )
+    result = await _run_device_flow(app, cache, on_device_code)
+    _persist(cache)
+    print("[Auth] Authenticated successfully.", flush=True)
+    return result["access_token"]

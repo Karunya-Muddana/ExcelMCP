@@ -5,13 +5,15 @@ constants at a tmp_path first, so running the suite can never clobber a real
 user's token cache or search index.
 """
 
+import asyncio
 import json
 
+import msal
 import numpy as np
 import pandas as pd
 import pytest
 
-from excelmcp import embeddings, query_engine, storage, structure
+from excelmcp import auth, embeddings, query_engine, storage, structure
 from excelmcp.graph_client import (
     _parse_retry_after,
     quote_drive_path,
@@ -321,3 +323,98 @@ class TestEmbeddings:
     def test_empty_descriptions_raise(self, fake_index):
         with pytest.raises(RuntimeError, match="No sheet descriptions"):
             embeddings.update_embeddings("/ERP", {"x.xlsx": {"sheets": {}}})
+
+
+# ------------------------------------------------------- device-code recovery
+
+
+class _ScriptedApp:
+    """A PublicClientApplication stand-in returning scripted token-endpoint results."""
+
+    def __init__(self, outcomes):
+        self.outcomes = list(outcomes)
+        self.codes_issued = 0
+
+    def initiate_device_flow(self, scopes=None):
+        self.codes_issued += 1
+        return {
+            "user_code": f"CODE{self.codes_issued}",
+            "verification_uri": "https://microsoft.com/devicelogin",
+        }
+
+    def acquire_token_by_device_flow(self, flow):
+        return self.outcomes.pop(0)
+
+
+# The exact shape Entra returns when our own poll redeems a code twice: the
+# first response carried the tokens but never arrived, so the retry found the
+# code spent. The user sees "All done!" in the browser and a failure in the CLI.
+_SPENT = {
+    "error": "invalid_grant",
+    "error_description": (
+        "AADSTS70000: The provided value for the input parameter 'device_code' "
+        "has already been used. Trace ID: t Correlation ID: c"
+    ),
+}
+_EXPIRED = {
+    "error": "expired_token",
+    "error_description": "AADSTS70019: Verification code expired.",
+}
+_DECLINED = {"error": "authorization_declined", "error_description": "User declined."}
+_GOOD = {"access_token": "tok", "expires_in": 3600}
+
+
+class TestDeviceFlowRecovery:
+    def _run(self, outcomes):
+        app = _ScriptedApp(outcomes)
+        announced = []
+        cache = msal.SerializableTokenCache()
+        result = asyncio.run(
+            auth._run_device_flow(app, cache, lambda f: announced.append(f["user_code"]))
+        )
+        return app, announced, result
+
+    def test_spent_code_starts_a_fresh_flow(self):
+        app, announced, result = self._run([_SPENT, _GOOD])
+        assert result["access_token"] == "tok"
+        assert app.codes_issued == 2
+        # A retry is useless unless the user is shown the new code.
+        assert announced == ["CODE1", "CODE2"]
+
+    def test_expired_code_starts_a_fresh_flow(self):
+        app, announced, result = self._run([_EXPIRED, _GOOD])
+        assert result["access_token"] == "tok"
+        assert announced == ["CODE1", "CODE2"]
+
+    def test_success_on_the_first_try_issues_one_code(self):
+        app, announced, result = self._run([_GOOD])
+        assert app.codes_issued == 1
+        assert announced == ["CODE1"]
+
+    def test_retries_are_bounded(self):
+        app = _ScriptedApp([_SPENT] * auth._DEVICE_FLOW_ATTEMPTS)
+        with pytest.raises(RuntimeError, match="never reached this machine"):
+            asyncio.run(auth._run_device_flow(app, msal.SerializableTokenCache(), lambda f: None))
+        assert app.codes_issued == auth._DEVICE_FLOW_ATTEMPTS
+
+    def test_declined_is_not_retried(self):
+        # Retrying a deliberate refusal just re-prompts a user who said no.
+        app = _ScriptedApp([_DECLINED, _GOOD])
+        with pytest.raises(RuntimeError, match="declined in the browser"):
+            asyncio.run(auth._run_device_flow(app, msal.SerializableTokenCache(), lambda f: None))
+        assert app.codes_issued == 1
+
+    def test_flow_that_never_starts_reports_the_reason(self):
+        class Broken:
+            def initiate_device_flow(self, scopes=None):
+                return {"error": "invalid_client", "error_description": "bad client id"}
+
+        with pytest.raises(RuntimeError, match="bad client id"):
+            asyncio.run(
+                auth._run_device_flow(Broken(), msal.SerializableTokenCache(), lambda f: None)
+            )
+
+    def test_consent_failure_explains_the_permission(self):
+        assert "Files.Read.All" in auth._device_flow_message(
+            {"error": "invalid_grant", "error_description": "AADSTS65004: user declined consent"}
+        )

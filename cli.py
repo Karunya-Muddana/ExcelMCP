@@ -283,12 +283,37 @@ def show_manual(specs: list[AgentSpec], folder: str) -> None:
 async def do_auth() -> bool:
     from excelmcp.auth import get_token
 
+    status = console.status("[cyan]Waiting for Microsoft sign-in...", spinner="dots")
+
+    def announce(flow: dict) -> None:
+        """Shows a device code. Called again with a new code if the first one is lost.
+
+        The spinner is a live display that owns the bottom of the terminal, so it
+        has to be stopped before anything else writes or the code can be painted
+        over and never seen.
+        """
+        status.stop()
+        uri = flow.get("verification_uri", "https://microsoft.com/devicelogin")
+        console.print()
+        console.print(
+            Panel(
+                f"Open [bold cyan]{uri}[/]\n"
+                f"Enter code  [bold black on bright_cyan] {flow['user_code']} [/]",
+                title="[bold]Sign in to Microsoft[/]",
+                border_style="cyan",
+                padding=(1, 3),
+            )
+        )
+        status.start()
+
     try:
-        with console.status("[cyan]Waiting for Microsoft sign-in...", spinner="dots"):
-            await get_token()
+        status.start()
+        await get_token(on_device_code=announce)
     except Exception as exc:
-        fail(f"Authentication failed: {exc}")
+        status.stop()
+        fail(str(exc))
         return False
+    status.stop()
     ok("Signed in to Microsoft.")
     return True
 
