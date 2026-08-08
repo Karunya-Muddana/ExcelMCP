@@ -18,9 +18,9 @@ Most spreadsheet integrations work by copying your data somewhere else. They ing
 
 ExcelMCP splits the problem in two.
 
-**Structure gets cached.** Filenames, sheet names, column headers, where the header row starts. This changes rarely, it is cheap to store, and it is what the agent needs in order to know *what to ask for*.
+**Structure gets cached.** Filenames, sheet names, column headers, where the header row starts, which columns hold dates, how sheets relate to each other — plus a small sample of distinct labels per low-cardinality column, which is what makes routing work across a hundred near-identical sheets. This changes rarely, it is cheap to store, and it is what the agent needs in order to know *what to ask for*. (The sampled labels are the one place structure touches values; the exact boundary is spelled out in [What lands on disk](#what-lands-on-disk).)
 
-**Data never gets cached.** Not once. Every tool call that returns a number goes out to the Microsoft Graph API and pulls the current used range. There is no data cache to go stale, no sync job to fall behind, and no cell value written to disk anywhere in this project.
+**Data never gets cached.** Every tool call that returns a number goes out to the Microsoft Graph API and pulls it live. There is no data cache to go stale, no sync job to fall behind, and no answer ever served from disk.
 
 Every response carries a `metadata.fetched_at` timestamp and an `is_cached: false` flag so the model can see, in band, that it is looking at fresh data.
 
@@ -32,7 +32,7 @@ Every response carries a `metadata.fetched_at` timestamp and an `is_cached: fals
   <img src="docs/architecture.png" alt="Your agent talks to the ExcelMCP server over MCP stdio. The server reads graph.json for structure with no network, vectors.npy for embedded sheet descriptions used to route questions, and the Microsoft Graph API for every cell value, fetched on demand from OneDrive." width="820">
 </p>
 
-A natural language question gets embedded, matched against the sheet descriptions by cosine similarity, and routed to the sheets most likely to hold the answer. Those sheets, and only those, get fetched live. Filtering and aggregation then happen in pandas on the freshly fetched frame.
+A natural language question gets embedded, matched against the sheet descriptions by cosine similarity, then reranked by lexical overlap with column names and sampled values — which is what keeps routing meaningful when twenty workbooks share one schema. Those sheets, and only those, get fetched live. Filtering and aggregation then happen in pandas on the freshly fetched frame. Single-value questions skip the row pipeline entirely: `lookup` reads one key column and one row and returns the cell with its provenance.
 
 ---
 
@@ -54,7 +54,7 @@ cd ExcelMCP
 
 uv sync      # install dependencies
 uv build     # build the wheel
-pip install dist/excelmcp-0.1.0-py3-none-any.whl
+pip install dist/excelmcp-0.2.0-py3-none-any.whl
 ```
 
 Or install straight from source without building:
@@ -118,13 +118,17 @@ excelmcp-setup --dry-run             # print the changes, write nothing
 
 | Tool | Network | What it does |
 |---|---|---|
-| `get_workspace_graph` | none | Full structure of the workspace: files, sheets, columns. Instant. |
-| `inspect_file` | none | Same, narrowed to one file. Instant. |
-| `scan_workspace` | heavy | Re-crawls OneDrive and rebuilds structure plus embeddings. |
-| `query` | live | Natural language question, semantically routed to the right sheets. |
+| `get_workspace_graph` | none | Full structure of the workspace: files, sheets, columns, relationships, naming variants, scan age. Instant. |
+| `inspect_file` | none | Same, narrowed to one file, with approximate row counts as of the last scan. Instant. |
+| `scan_workspace` | heavy | Re-crawls OneDrive and rebuilds structure, sampled values, relationships, embeddings. |
+| `query` | live | Natural language question, routed by vector similarity plus lexical rerank. |
+| `lookup` | live | One call → one cell value with file/sheet/cell provenance and a confidence signal. |
+| `get_cell` | live | One addressed cell in one Graph request. |
 | `filter_sheet` | live | Fetch one sheet, return rows matching conditions. |
-| `aggregate` | live | Fetch one sheet, group and reduce it. |
-| `cross_file_aggregate` | live | Fetch matching sheets from every file in parallel, then total. |
+| `aggregate` | live | Fetch one sheet, group and reduce it, with `having`. |
+| `cross_file_aggregate` | live | Fetch matching sheets from every file, fold into a total. |
+| `join_sheets` | live | Merge two sheets on key columns, suggested from known relationships. |
+| `derive` | live | Signed sum over transaction types — net stock in one call. |
 
 The two structure tools are free and instant because they read the local graph. Everything marked live goes to the API on every single call.
 
@@ -163,14 +167,25 @@ Supported condition operators, all ANDed together:
 
 | Form | Meaning |
 |---|---|
-| `{"Col": "value"}` | exact match |
+| `{"Col": "value"}` | exact match — case- and whitespace-insensitive; pass `exact_case=True` for strict |
 | `{"Col": "~value"}` | contains, literal substring, not a regex |
-| `{"Col": ">100"}` | greater than |
-| `{"Col": ">=100"}` | greater or equal |
-| `{"Col": "<100"}` | less than |
-| `{"Col": "<=100"}` | less or equal |
+| `{"Col": ">100"}` | greater than (also `>=`, `<`, `<=`) |
+| `{"Col": ">=2026-01-01"}` | date bound, ISO-8601, works on detected date columns |
+| `{"Col": {"in": ["a", "b"]}}` | any of the listed values |
+| `{"Col": {"between": [10, 500]}}` | inclusive range, numeric or date |
+| `{"Col": {">=": "2026-01-01", "<": "2026-04-01"}}` | combined bounds |
+| `{"Col": {"is_null": false}}` | null check — blanks and empty strings count as null |
 
-A column name that does not exist raises an error rather than quietly returning zero rows, which is the failure mode that makes an agent confidently report the wrong thing.
+A column name or operator that does not exist raises an error rather than quietly returning zero rows, which is the failure mode that makes an agent confidently report the wrong thing. When conditions legitimately match nothing, the response carries `zero_match_diagnostics` — what each condition matched on its own, plus up to twenty values actually present in the offending column — so a near-miss gets corrected instead of reported as "no data".
+
+Ask for a single figure in one call:
+
+```python
+lookup(query="contracted rate for Titanium Dioxide under the BESTEX contract",
+       folder_path="/Contracts")
+```
+
+The answer comes back with provenance — file, sheet, cell address, the matched row — and a confidence field. Multiple matching rows return `ambiguous` with every row; sheets that disagree return `conflict` with every version and no value; a misspelled key returns fuzzy suggestions. The tool never returns a bare number.
 
 Group and reduce inside one file:
 
@@ -197,7 +212,7 @@ cross_file_aggregate(
 )
 ```
 
-`cross_file_aggregate` returns a per-file breakdown alongside the total, plus `skipped_files` and a `warning` when some file could not be read. That way a partial total is visibly partial instead of silently wrong.
+`cross_file_aggregate` returns a per-file breakdown alongside the total, plus `skipped_files` when a file could not be read and `unmatched_files` — with `did_you_mean` candidates — for every file that does not contain the exact sheet name. That way a partial total is visibly partial instead of silently wrong, including the case where the sheet is named `Sales` in some files and `Sales 2024` in others. Check `sheet_name_variants` in `get_workspace_graph` before aggregating to see that fragmentation up front.
 
 ---
 
@@ -222,8 +237,9 @@ The server ships a set of operating rules in its MCP instructions, which the hos
 - Never assume a filename, sheet name, or column name. Discover it from the graph.
 - Never add up cross-file numbers mentally. Call `cross_file_aggregate` and let the tool do it.
 - Never reach for `openpyxl`, `pandas.read_excel`, or the local filesystem. The files are not on this machine.
-- Never sum a quantity column in transaction-style data without filtering by transaction type first.
-- Treat numeric dates as Excel serials, offset from 1899-12-30.
+- Never sum a quantity column in transaction-style data raw — use `derive` with the transaction types spelled out.
+- Date columns arrive as ISO-8601 strings, already converted from serials by the server. Never do serial arithmetic by hand.
+- For a single figure, call `lookup` and cite the provenance it returns; surface its `ambiguous` and `conflict` outcomes instead of picking a value.
 - Check the `truncated` and `total_matched` fields before claiming a result is complete.
 
 Hosts that ignore server instructions, and custom agents you build yourself, need this stated in their own prompt. See [agents/system-prompt.md](agents/system-prompt.md).
@@ -237,6 +253,7 @@ Hosts that ignore server instructions, and custom agents you build yourself, nee
 | `EXCELMCP_CLIENT_ID` | built in | Azure AD application client ID |
 | `EXCELMCP_TENANT_ID` | `common` | Tenant. Use `common` for personal accounts. |
 | `EXCELMCP_DEFAULT_FOLDER` | unset | Folder to use when a tool call omits `folder_path`. The wizard writes this into your agent config. |
+| `EXCELMCP_MAX_CONCURRENCY` | `8` | Maximum simultaneous Microsoft Graph requests, across every code path. |
 
 The built in client ID is a public client used for device-code flow. It carries no secret, it is visible in every auth request by design, and it is safe to have in this repository. Swap it for your own app registration if you want the consent screen to carry your organisation's name.
 
@@ -246,13 +263,30 @@ The built in client ID is a public client used for device-code flow. It carries 
 
 ```
 ~/.excelmcp/
-  token.json      MSAL token cache. Auth material only, written 0600.
-  graph.json      Structure graph: item IDs, sheet names, column headers.
-  vectors.npy     Embedded sheet descriptions for semantic routing.
-  metadata.json   Labels tying each embedding back to a sheet.
+  token.json           MSAL token cache. Auth material only, written 0600.
+  graph.json           Structure graph: item IDs, sheet names, column headers,
+                       used-range dimensions, date column types, inferred
+                       relationships — and sampled values (see below).
+  vectors.npy          Embedded sheet descriptions for semantic routing.
+  metadata.json        Labels and lexical terms tying each embedding to a sheet.
+  relationships.yaml   Optional, written by you: declared join relationships.
 ```
 
-No cell value appears in any of these files. If you want to verify that claim rather than take it on faith, `graph.json` is small and readable, so go look.
+**The honest version of the no-cache claim, as of 0.2.0.** No row of your
+data, no cell grid, and no queryable value is stored on disk — every answer
+is served from a live fetch, always. There is one deliberate exception:
+`graph.json` stores **sampled values**, up to 50 distinct text labels per
+low-cardinality column (client names, statuses, material names, units),
+captured at scan time. They exist so that a hundred structurally identical
+sheets are distinguishable when routing a question, so that `lookup` can find
+which sheet contains "BESTEX" without downloading everything, and so that
+relationships can be inferred from value overlap rather than assumed from
+column names. They are routing evidence, not a data cache: nothing ever
+answers a question from them, and a workspace scan refreshes them wholesale.
+The graph also stores a per-sheet structure fingerprint (header columns and
+used-range address) purely to detect drift. If any of this is more than you
+want on disk, don't scan that folder; if you want to verify the boundary,
+`graph.json` is small and readable, so go look.
 
 On Windows, `os.chmod` only toggles the read-only bit, so the `0600` mode is a best effort there and the real protection is the default per-user ACL on `%USERPROFILE%`. On macOS and Linux the mode is applied to the temp file before any content is written to it, so the token never briefly exists as world readable.
 
@@ -277,14 +311,16 @@ The integration suite skips itself when `EXCELMCP_TEST_FOLDER` is unset, so a pl
 ```
 agents/           prompts, host guides, and schedulable routines
 auth.py           MSAL device flow, token cache, proactive refresh
-graph_client.py   Graph API wrapper, 429 backoff, session reuse
-structure.py      Structure discovery, writes graph.json
-embeddings.py     FastEmbed vectors plus NumPy cosine search
-query_engine.py   Semantic routing, live fetch, pandas operations
+graph_client.py   Graph API wrapper, 429 backoff, shared concurrency gate
+structure.py      Structure discovery, value sampling, relationship inference
+embeddings.py     FastEmbed vectors, NumPy cosine search, lexical rerank
+query_engine.py   Conditions, live fetch, aggregation, joins, derive
+lookup.py         Single-cell lookup pipeline and get_cell
+ranges.py         A1-notation range arithmetic
 main.py           FastMCP tool definitions and server entry point
 cli.py            Setup wizard, agent detection, config writing
 agents.py         Per agent config formats and file locations
-storage.py        Atomic writes and config directory handling
+storage.py        Atomic writes, stderr logging, config directory handling
 ```
 
 ---

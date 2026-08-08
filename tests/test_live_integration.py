@@ -50,12 +50,17 @@ def first_sheet(workspace):
 
 
 class TestStructureInvariant:
-    def test_graph_stores_no_cell_values(self, workspace):
-        """The core design rule: structure is cached, data never is."""
+    def test_graph_stores_no_sheet_data(self, workspace):
+        """The core design rule: structure is cached, data never is.
+
+        The one deliberate, documented exception is sampled_values — a
+        handful of distinct labels per low-cardinality column, kept for
+        routing and relationship inference. No row or grid data may appear.
+        """
         for file_name, info in workspace["files"].items():
             for sheet_name, sheet in info.get("sheets", {}).items():
-                assert "values" not in sheet, f"cell values cached in {file_name}/{sheet_name}"
-                assert "rows" not in sheet, f"cell values cached in {file_name}/{sheet_name}"
+                assert "values" not in sheet, f"cell grid cached in {file_name}/{sheet_name}"
+                assert "rows" not in sheet, f"row data cached in {file_name}/{sheet_name}"
                 assert set(sheet) <= {
                     "header_row",
                     "columns",
@@ -64,7 +69,11 @@ class TestStructureInvariant:
                     "used_range_address",
                     "row_count",
                     "column_count",
+                    "column_types",
+                    "sampled_values",
                 }
+                for col, values in sheet.get("sampled_values", {}).items():
+                    assert len(values) <= 50, f"oversampled {file_name}/{sheet_name}/{col}"
 
     def test_every_file_has_an_item_id(self, workspace):
         for file_name, info in workspace["files"].items():
