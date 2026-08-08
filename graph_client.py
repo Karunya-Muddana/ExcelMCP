@@ -470,6 +470,26 @@ async def get_used_range(
     return data or {}
 
 
+async def get_named_range(
+    item_id: str,
+    name: str,
+    session_id: Optional[str] = None,
+    *,
+    select: Optional[str] = _DATA_RANGE_SELECT,
+) -> dict[str, Any]:
+    """Resolves a workbook-scoped named range to its range resource."""
+    url = (
+        f"{_item_url(item_id)}/workbook/names"
+        f"('{quote_odata_literal(name)}')/range"
+    )
+    headers: dict[str, str] = {}
+    if session_id:
+        headers["workbook-session-id"] = session_id
+    params = {"$select": select} if select else None
+    data = await _request("GET", url, headers=headers, params=params)
+    return data or {}
+
+
 async def get_range(
     item_id: str,
     sheet_name: str,

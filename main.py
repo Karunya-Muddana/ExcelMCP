@@ -5,6 +5,7 @@ from typing import Any, Optional
 from fastmcp import FastMCP
 
 from excelmcp.embeddings import update_embeddings
+from excelmcp.lookup import execute_get_cell, execute_lookup
 from excelmcp.query_engine import (
     MAX_ROWS_RETURNED,
     execute_aggregate,
@@ -100,6 +101,14 @@ Row-returning tools cap output. If a response has
 truncated=true, total_matched tells you how many rows
 actually matched. Narrow the query with conditions or
 use aggregate instead of assuming you saw everything.
+
+RULE 12 — ONE VALUE MEANS ONE lookup CALL
+When the user asks for a single figure — a rate, a
+price, one item's stock — call lookup first. It returns
+the value with file/sheet/cell provenance in one call.
+Check its confidence field, surface conflicts and
+ambiguity instead of picking a value, and always cite
+where the number came from.
 """,
 )
 
@@ -487,6 +496,90 @@ async def inspect_file(file_name: str, folder_path: Optional[str] = None) -> dic
     result = await execute_inspect_file(file_name, folder)
     sheets = list(result.get("sheets", {}).keys())
     return wrap_response(result, [file_name], sheets, 0)
+
+
+@mcp.tool(
+    description="""
+Reads EXACTLY ONE cell, LIVE, by address. One Graph
+request, tiny payload, no ambiguity.
+Use when the location is already known — follow-up
+questions, scheduled routines, anything where lookup or
+filter_sheet already established the address earlier.
+address is A1 notation ("B7") or the name of a
+workbook-scoped named range that resolves to one cell.
+Serial dates arrive converted to ISO-8601; check
+resolved_type. A multi-cell address is an error — use
+filter_sheet for ranges.
+"""
+)
+async def get_cell(
+    file_name: str,
+    sheet: str,
+    address: str,
+    folder_path: Optional[str] = None,
+) -> dict:
+    folder = _resolve_folder(folder_path)
+    result = await execute_get_cell(file_name, sheet, address, folder)
+    return wrap_response(result, [file_name], [sheet], 1)
+
+
+@mcp.tool(
+    description="""
+ONE-CALL semantic lookup: finds a single cell value
+anywhere in the workspace and returns it WITH PROVENANCE
+(file, sheet, cell address, the matched row) and a
+confidence signal. Reads only the key column and the
+matched row — never whole sheets.
+
+Two ways to call it:
+1. Natural language: lookup(query="contracted rate for
+   Titanium Dioxide under the BESTEX contract"). The
+   server resolves the key value against values sampled
+   at scan time and picks the return column lexically.
+   Works best when the query contains a literal value
+   that appears in the data (a client, a material).
+2. Explicit: lookup(key_column="Material", key_value=
+   "Titanium Dioxide", return_column="Contracted Rate").
+   Use this when the query form reports it could not
+   parse, or for values too rare to be sampled.
+scope={"file": ..., "sheet": ...} narrows the search.
+
+READ confidence BEFORE using the value:
+  "high"      — single row matched; corroborating sheets
+                (if any) agree. provenance.corroborated_by
+                lists them.
+  "ambiguous" — the key matched SEVERAL ROWS. value is
+                null; every row is in alternatives. Never
+                pick one silently.
+  "conflict"  — several sheets DISAGREE. value is null;
+                every version is in alternatives. Surface
+                the conflict to the user.
+found=false   — key not found; suggestions holds fuzzy
+                near-misses (retry with exact spelling),
+                or ambiguity explains why routing failed.
+NEVER present a value from this tool without citing
+provenance.file, provenance.sheet and provenance.cell.
+"""
+)
+async def lookup(
+    query: Optional[str] = None,
+    key_column: Optional[str] = None,
+    key_value: Optional[str] = None,
+    return_column: Optional[str] = None,
+    folder_path: Optional[str] = None,
+    scope: Optional[dict] = None,
+) -> dict:
+    folder = _resolve_folder(folder_path)
+    result = await execute_lookup(
+        query, key_column, key_value, return_column, folder, scope
+    )
+    searched = result.get("searched") or []
+    files_queried = sorted({s["file"] for s in searched if s.get("file")})
+    sheets_queried = sorted({s["sheet"] for s in searched if s.get("sheet")})
+    if result.get("provenance"):
+        files_queried = files_queried or [result["provenance"]["file"]]
+        sheets_queried = sheets_queried or [result["provenance"]["sheet"]]
+    return wrap_response(result, files_queried, sheets_queried, 0)
 
 
 def main() -> None:
