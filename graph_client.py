@@ -402,15 +402,63 @@ async def get_sheet_names(item_id: str, session_id: Optional[str] = None) -> lis
     return [sheet["name"] for sheet in (data or {}).get("value", [])]
 
 
+# Without $select, Graph returns the full Range resource — values, text,
+# formulas, formulasLocal, formulasR1C1, numberFormat, valueTypes, ... — several
+# full-size 2D arrays of which only `values` was ever read. Selecting just what
+# the data path uses cuts the payload of every live call by roughly 5-6x.
+# address/rowCount/columnCount ride along because range narrowing and drift
+# detection need them and they are one small string and two ints.
+_DATA_RANGE_SELECT = "values,address,rowCount,columnCount"
+
+
 async def get_used_range(
-    item_id: str, sheet_name: str, session_id: Optional[str] = None
+    item_id: str,
+    sheet_name: str,
+    session_id: Optional[str] = None,
+    *,
+    select: Optional[str] = _DATA_RANGE_SELECT,
+    values_only: bool = False,
 ) -> dict[str, Any]:
+    """Fetches a sheet's used range, selecting only the fields the caller needs.
+
+    values_only=True uses usedRange(valuesOnly=true), which excludes cells that
+    carry formatting but no value. Pass select=None to fetch the full resource
+    (scan-time callers that need numberFormat widen the selection instead).
+    """
+    used_range = "usedRange(valuesOnly=true)" if values_only else "usedRange"
     url = (
         f"{_item_url(item_id)}/workbook/worksheets"
-        f"('{quote_odata_literal(sheet_name)}')/usedRange"
+        f"('{quote_odata_literal(sheet_name)}')/{used_range}"
     )
     headers: dict[str, str] = {}
     if session_id:
         headers["workbook-session-id"] = session_id
-    data = await _request("GET", url, headers=headers)
+    params = {"$select": select} if select else None
+    data = await _request("GET", url, headers=headers, params=params)
+    return data or {}
+
+
+async def get_range(
+    item_id: str,
+    sheet_name: str,
+    address: str,
+    session_id: Optional[str] = None,
+    *,
+    select: Optional[str] = _DATA_RANGE_SELECT,
+) -> dict[str, Any]:
+    """Fetches one addressed range ('A1:AZ10', 'H347') instead of a whole sheet.
+
+    This is what lets header detection and single-cell lookup move kilobytes
+    where usedRange moves megabytes.
+    """
+    url = (
+        f"{_item_url(item_id)}/workbook/worksheets"
+        f"('{quote_odata_literal(sheet_name)}')"
+        f"/range(address='{quote_odata_literal(address)}')"
+    )
+    headers: dict[str, str] = {}
+    if session_id:
+        headers["workbook-session-id"] = session_id
+    params = {"$select": select} if select else None
+    data = await _request("GET", url, headers=headers, params=params)
     return data or {}

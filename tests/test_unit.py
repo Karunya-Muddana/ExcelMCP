@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from excelmcp import auth, embeddings, query_engine, storage, structure
+from excelmcp import auth, embeddings, graph_client, query_engine, storage, structure
 from excelmcp.graph_client import (
     _parse_retry_after,
     quote_drive_path,
@@ -57,6 +57,51 @@ class TestUrlEncoding:
 
     def test_drive_path_normalises_empty_segments(self):
         assert quote_drive_path("//ERP//") == "/ERP"
+
+
+# ---------------------------------------------------------- range requests
+
+
+@pytest.fixture
+def captured_requests(monkeypatch):
+    """Replaces the HTTP layer, recording every (method, url, params) triple."""
+    calls = []
+
+    async def fake_request(method, url, headers=None, json_data=None, params=None):
+        calls.append({"method": method, "url": url, "params": params})
+        return {"values": []}
+
+    monkeypatch.setattr(graph_client, "_request", fake_request)
+    return calls
+
+
+class TestRangeRequests:
+    def test_used_range_selects_only_data_fields(self, captured_requests):
+        # Without $select Graph returns text/formulas/numberFormat/... — several
+        # full-size 2D arrays of which only `values` was ever read.
+        asyncio.run(graph_client.get_used_range("item", "Sheet1"))
+        call = captured_requests[0]
+        assert call["url"].endswith("/usedRange")
+        assert call["params"] == {"$select": "values,address,rowCount,columnCount"}
+
+    def test_values_only_variant(self, captured_requests):
+        asyncio.run(graph_client.get_used_range("item", "Sheet1", values_only=True))
+        assert captured_requests[0]["url"].endswith("/usedRange(valuesOnly=true)")
+
+    def test_select_none_fetches_full_resource(self, captured_requests):
+        asyncio.run(graph_client.get_used_range("item", "Sheet1", select=None))
+        assert captured_requests[0]["params"] is None
+
+    def test_get_range_addresses_one_range(self, captured_requests):
+        asyncio.run(graph_client.get_range("item", "Sheet1", "B7"))
+        call = captured_requests[0]
+        assert "range(address='B7')" in call["url"]
+        assert call["params"] == {"$select": "values,address,rowCount,columnCount"}
+
+    def test_get_range_encodes_hostile_addresses(self, captured_requests):
+        # An address is caller-supplied text; it must not break out of the URL.
+        asyncio.run(graph_client.get_range("item", "Q1/Q2", "A1"))
+        assert "Q1/Q2" not in captured_requests[0]["url"]
 
 
 # ------------------------------------------------------------- Retry-After
