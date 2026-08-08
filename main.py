@@ -10,11 +10,18 @@ from excelmcp.query_engine import (
     MAX_ROWS_RETURNED,
     execute_aggregate,
     execute_cross_file_aggregate,
+    execute_derive,
     execute_filter_sheet,
     execute_inspect_file,
+    execute_join_sheets,
     execute_query,
 )
-from excelmcp.structure import discover_structure, load_graph, sheet_name_variants
+from excelmcp.structure import (
+    discover_structure,
+    load_graph,
+    sheet_name_variants,
+    workspace_relationships,
+)
 
 mcp = FastMCP(
     "ExcelMCP",
@@ -159,7 +166,11 @@ def wrap_response(
 @mcp.tool(
     description="""
 Returns the cached file structure — all filenames, sheet
-names, and column headers.
+names, column headers, and cross-sheet relationships
+(inferred at scan time from matching column names plus
+overlapping sampled values, merged with any the user
+declared in ~/.excelmcp/relationships.yaml; each carries
+a confidence score and its evidence).
 INSTANT — makes no API call. Reads from local graph.json.
 ALWAYS call this first at session start to orient yourself.
 Shows you exactly which files exist, what sheets they have,
@@ -193,6 +204,8 @@ async def get_workspace_graph(folder_path: Optional[str] = None) -> dict:
     # Sheet-name fragmentation ('Sales' vs 'sales ' vs 'SALES') silently
     # shrinks cross-file totals; surface it before the agent aggregates.
     data["sheet_name_variants"] = sheet_name_variants(workspace.get("files", {}))
+    # Declared relationships (relationships.yaml) merged ahead of inferred.
+    data["relationships"] = workspace_relationships(workspace)
     scan_age = _scan_age(workspace.get("files", {}))
     if scan_age:
         data["scan_age"] = scan_age
@@ -496,6 +509,105 @@ async def inspect_file(file_name: str, folder_path: Optional[str] = None) -> dic
     result = await execute_inspect_file(file_name, folder)
     sheets = list(result.get("sheets", {}).keys())
     return wrap_response(result, [file_name], sheets, 0)
+
+
+@mcp.tool(
+    description="""
+Joins two sheets LIVE on key columns and returns the
+merged rows, with filter_sheet's truncation contract
+(total_matched, truncated, limit).
+Omit left_on/right_on to let the server pick keys from
+the workspace's known relationships — it uses a declared
+or high-confidence inferred relationship and REFUSES
+with the candidate list when confidence is low, rather
+than guessing. The keys actually used and their source
+are in data.keys.
+Key matching is normalised (case, whitespace, 45 vs
+45.0); null keys never join. join_type: inner, left,
+right, outer. Colliding column names get _left/_right
+suffixes.
+Use this instead of stitching filter_sheet results
+together yourself.
+"""
+)
+async def join_sheets(
+    left_file: str,
+    left_sheet: str,
+    right_file: str,
+    right_sheet: str,
+    left_on: Optional[str] = None,
+    right_on: Optional[str] = None,
+    join_type: str = "inner",
+    folder_path: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> dict:
+    folder = _resolve_folder(folder_path)
+    result = await execute_join_sheets(
+        folder, left_file, left_sheet, right_file, right_sheet,
+        left_on, right_on, join_type, limit,
+    )
+    data = {
+        "rows": result["rows"],
+        "keys": result["keys"],
+        "join_type": result["join_type"],
+        "total_matched": result["total_matched"],
+        "truncated": result["truncated"],
+    }
+    if "drifted_files" in result:
+        data["drifted_files"] = result["drifted_files"]
+    return wrap_response(
+        data,
+        [left_file, right_file],
+        [result["left"]["sheet"], result["right"]["sheet"]],
+        result["row_count"],
+    )
+
+
+@mcp.tool(
+    description="""
+Computes a NET value over transaction types in one call:
+sum of sign * groupwise_sum(quantity_col) across the
+given components. This is how a stock figure like
+  receipts + purchases − consumption − returns
+becomes ONE call with the arithmetic done in pandas,
+instead of five filter_sheet calls added up in your
+head (which RULE 3 forbids).
+
+components is a list of
+  {"conditions": {...same grammar as filter_sheet...},
+   "sign": 1 or -1, "label": "receipts"}
+conditions (optional) pre-filters the sheet before any
+component applies.
+The response includes a per-component breakdown with
+rows_matched. A component that matched ZERO rows is
+flagged and warned about — check the spelling of the
+transaction type before trusting the net.
+"""
+)
+async def derive(
+    file_name: str,
+    sheet: str,
+    group_by: Any,
+    quantity_col: str,
+    components: list,
+    folder_path: Optional[str] = None,
+    conditions: Optional[dict] = None,
+) -> dict:
+    folder = _resolve_folder(folder_path)
+    result = await execute_derive(
+        folder, file_name, sheet, group_by, quantity_col, components, conditions
+    )
+    data = {
+        "rows": result["rows"],
+        "components": result["components"],
+        "truncated": result["truncated"],
+    }
+    for extra in ("warning", "structure_drift"):
+        if result.get(extra):
+            data[extra] = result[extra]
+    return wrap_response(
+        data, [result["file"]], [result["sheet"]], result["row_count"]
+    )
 
 
 @mcp.tool(

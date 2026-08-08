@@ -136,6 +136,121 @@ def detect_header_row(used_range_data: dict[str, Any]) -> tuple[int, list[str], 
     return 0, columns_from_row(values[0]), False
 
 
+# ------------------------------------------------------------ relationships
+
+# A relationship is only ever *inferred* from two signals agreeing: the
+# column names normalise to the same token (Material_ID ~ MaterialID ~
+# 'material id') AND the sampled value sets overlap. Name match alone is an
+# assumption; value overlap alone is coincidence; together they are evidence.
+_RELATIONSHIP_MIN_OVERLAP = 0.3
+_MAX_RELATIONSHIPS = 200
+
+
+def _column_token(name: Any) -> str:
+    """'Material_ID', 'materialid' and 'Material ID' all become 'materialid'."""
+    return re.sub(r"[^a-z0-9]", "", str(name).casefold())
+
+
+def infer_relationships(files: dict[str, Any]) -> list[dict[str, Any]]:
+    """Cross-sheet key relationships, inferred from names plus sampled values.
+
+    Only sampled (low-cardinality) columns participate — inference never runs
+    on columns it has no value evidence for. Each relationship carries its
+    confidence (the value-overlap ratio) and the evidence behind it.
+    """
+    entries = []
+    for file_name, file_info in files.items():
+        for sheet_name, sheet_info in file_info.get("sheets", {}).items():
+            for column, values in sheet_info.get("sampled_values", {}).items():
+                token = _column_token(column)
+                normalised = {normalise_name(v) for v in values}
+                if token and len(normalised) >= 2:
+                    entries.append(
+                        (file_name, sheet_name, column, token, normalised)
+                    )
+
+    relationships = []
+    for i in range(len(entries)):
+        for j in range(i + 1, len(entries)):
+            a, b = entries[i], entries[j]
+            if a[3] != b[3] or (a[0], a[1]) == (b[0], b[1]):
+                continue
+            shared = a[4] & b[4]
+            overlap = len(shared) / min(len(a[4]), len(b[4]))
+            if overlap < _RELATIONSHIP_MIN_OVERLAP:
+                continue
+            relationships.append(
+                {
+                    "left": {"file": a[0], "sheet": a[1], "column": a[2]},
+                    "right": {"file": b[0], "sheet": b[1], "column": b[2]},
+                    "confidence": round(overlap, 3),
+                    "source": "inferred",
+                    "evidence": {
+                        "name_token": a[3],
+                        "value_overlap": round(overlap, 3),
+                        "left_sample_size": len(a[4]),
+                        "right_sample_size": len(b[4]),
+                    },
+                }
+            )
+    relationships.sort(key=lambda r: -r["confidence"])
+    return relationships[:_MAX_RELATIONSHIPS]
+
+
+def get_relationships_yaml_path() -> Path:
+    return get_config_dir() / "relationships.yaml"
+
+
+def load_declared_relationships() -> list[dict[str, Any]]:
+    """User-declared relationships from ~/.excelmcp/relationships.yaml.
+
+    Inference covers a well-named workspace; the last stretch needs a human to
+    state it once. Declared entries carry confidence 1.0 and outrank anything
+    inferred. Expected shape:
+
+        relationships:
+          - left:  {file: A.xlsx, sheet: Stock,  column: Material}
+            right: {file: B.xlsx, sheet: Prices, column: Material_ID}
+    """
+    path = get_relationships_yaml_path()
+    if not path.exists():
+        return []
+    import yaml
+
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as exc:
+        log(f"[Relationships] Ignoring unreadable {path.name}: {exc}")
+        return []
+    if not isinstance(data, dict):
+        return []
+
+    declared = []
+    for item in data.get("relationships", []) or []:
+        left, right = item.get("left"), item.get("right")
+        if not (
+            isinstance(left, dict)
+            and isinstance(right, dict)
+            and all(k in left and k in right for k in ("file", "sheet", "column"))
+        ):
+            log(f"[Relationships] Skipping malformed entry in {path.name}: {item!r}")
+            continue
+        declared.append(
+            {
+                "left": {k: str(left[k]) for k in ("file", "sheet", "column")},
+                "right": {k: str(right[k]) for k in ("file", "sheet", "column")},
+                "confidence": 1.0,
+                "source": "declared",
+            }
+        )
+    return declared
+
+
+def workspace_relationships(workspace: dict[str, Any]) -> list[dict[str, Any]]:
+    """Declared relationships first, then inferred ones from the last scan."""
+    return load_declared_relationships() + list(workspace.get("relationships", []))
+
+
 # Value sampling bounds. Sampled values are the one deliberate exception to
 # the "no cell values on disk" guarantee: a handful of distinct labels per
 # low-cardinality column, persisted so that twenty structurally identical
@@ -442,7 +557,9 @@ async def discover_structure(folder_path: str) -> dict[str, Any]:
 
     workspace = {
         "files": discovered,
-        "relationships": graph["workspaces"].get(folder_path, {}).get("relationships", []),
+        # Recomputed from scratch each scan; user-declared relationships live
+        # in relationships.yaml and are merged in at read time, not persisted.
+        "relationships": infer_relationships(discovered),
     }
     graph["workspaces"][folder_path] = workspace
 

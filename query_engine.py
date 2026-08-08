@@ -9,7 +9,13 @@ import pandas as pd
 from excelmcp.embeddings import search
 from excelmcp.graph_client import GraphAPIError, get_used_range
 from excelmcp.storage import log
-from excelmcp.structure import columns_from_row, fuzzy_name_candidates, load_graph
+from excelmcp.structure import (
+    columns_from_row,
+    fuzzy_name_candidates,
+    load_graph,
+    normalise_name,
+    workspace_relationships,
+)
 
 # Hard ceiling on rows returned by a single tool call. An unfiltered sheet can
 # hold hundreds of thousands of rows; returning them all would blow out the
@@ -856,3 +862,287 @@ async def execute_cross_file_aggregate(
         "drifted_files": drifted,
         "warning": " ".join(warnings) if warnings else None,
     }
+
+
+# ----------------------------------------------------------------- joining
+
+
+_JOIN_TYPES = {"inner", "left", "right", "outer"}
+
+
+def _join_key_value(value: Any) -> Any:
+    """Canonical join key: numbers by numeric value, strings normalised.
+
+    Excel key columns mix '45', 45 and 45.0, and carry stray whitespace and
+    case differences; joining on raw values silently drops matching rows.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        try:
+            return repr(float(value))
+        except (TypeError, ValueError):
+            return normalise_name(value) or None
+    text = normalise_name(value)
+    if not text:
+        return None
+    try:
+        return repr(float(text))
+    except ValueError:
+        return text
+
+
+def _suggest_join_keys(
+    folder_path: str,
+    workspace: dict[str, Any],
+    left_file: str,
+    left_sheet: str,
+    right_file: str,
+    right_sheet: str,
+) -> tuple[str, str, dict[str, Any]]:
+    """Resolves join keys from known relationships, refusing rather than guessing."""
+    candidates = []
+    for rel in workspace_relationships(workspace):
+        ends = (rel.get("left", {}), rel.get("right", {}))
+        for a, b in (ends, ends[::-1]):
+            if (
+                a.get("file") == left_file
+                and a.get("sheet") == left_sheet
+                and b.get("file") == right_file
+                and b.get("sheet") == right_sheet
+            ):
+                candidates.append(
+                    {
+                        "left_on": a["column"],
+                        "right_on": b["column"],
+                        "confidence": rel.get("confidence", 0.0),
+                        "source": rel.get("source", "inferred"),
+                    }
+                )
+
+    declared = [c for c in candidates if c["source"] == "declared"]
+    confident = [c for c in candidates if c["confidence"] >= 0.5]
+    if declared:
+        chosen = declared[0]
+    elif len(confident) == 1:
+        chosen = confident[0]
+    elif len(confident) > 1:
+        raise ValueError(
+            f"Several plausible join keys exist between "
+            f"'{left_file}'/'{left_sheet}' and '{right_file}'/'{right_sheet}': "
+            f"{[(c['left_on'], c['right_on'], c['confidence']) for c in confident]}. "
+            f"Pass left_on/right_on explicitly."
+        )
+    else:
+        hint = (
+            f" Low-confidence candidates: "
+            f"{[(c['left_on'], c['right_on'], c['confidence']) for c in candidates]}."
+            if candidates
+            else ""
+        )
+        raise ValueError(
+            f"No confident relationship is known between "
+            f"'{left_file}'/'{left_sheet}' and '{right_file}'/'{right_sheet}'. "
+            f"Pass left_on/right_on explicitly, or declare the relationship in "
+            f"~/.excelmcp/relationships.yaml.{hint}"
+        )
+    return chosen["left_on"], chosen["right_on"], chosen
+
+
+async def execute_join_sheets(
+    folder_path: str,
+    left_file: str,
+    left_sheet: str,
+    right_file: str,
+    right_sheet: str,
+    left_on: Optional[str] = None,
+    right_on: Optional[str] = None,
+    join_type: str = "inner",
+    limit: Optional[int] = None,
+) -> dict:
+    folder_path = folder_path.rstrip("/")
+    if join_type not in _JOIN_TYPES:
+        raise ValueError(
+            f"Unknown join_type '{join_type}'. Use: {', '.join(sorted(_JOIN_TYPES))}."
+        )
+    if (left_on is None) != (right_on is None):
+        raise ValueError("Pass both left_on and right_on, or neither.")
+    effective_limit = _clamp_limit(limit)
+
+    graph = load_graph()
+    workspace = graph.get("workspaces", {}).get(folder_path, {})
+    if not workspace:
+        raise ValueError(
+            f"Workspace '{folder_path}' not found. Run scan_workspace first."
+        )
+
+    _, left_info = _get_file_info(folder_path, left_file)
+    left_sheet_info = _resolve_sheet(left_info, left_sheet, left_file)
+    _, right_info = _get_file_info(folder_path, right_file)
+    right_sheet_info = _resolve_sheet(right_info, right_sheet, right_file)
+
+    keys_meta: dict[str, Any]
+    if left_on is None:
+        left_on, right_on, keys_meta = _suggest_join_keys(
+            folder_path, workspace, left_file, left_sheet, right_file, right_sheet
+        )
+    else:
+        keys_meta = {
+            "left_on": left_on,
+            "right_on": right_on,
+            "source": "caller",
+            "confidence": None,
+        }
+
+    (left_df, left_drift), (right_df, right_drift) = await asyncio.gather(
+        _fetch_sheet_data(left_info["item_id"], left_sheet, left_sheet_info),
+        _fetch_sheet_data(right_info["item_id"], right_sheet, right_sheet_info),
+    )
+
+    if left_on not in left_df.columns:
+        raise ValueError(
+            f"Join column '{left_on}' not found in '{left_file}'/'{left_sheet}'. "
+            f"Available: {list(left_df.columns)}"
+        )
+    if right_on not in right_df.columns:
+        raise ValueError(
+            f"Join column '{right_on}' not found in '{right_file}'/'{right_sheet}'. "
+            f"Available: {list(right_df.columns)}"
+        )
+
+    left_df = left_df.copy()
+    right_df = right_df.copy()
+    left_df["__excelmcp_key"] = left_df[left_on].map(_join_key_value)
+    right_df["__excelmcp_key"] = right_df[right_on].map(_join_key_value)
+    # Null keys never join — a blank cell matching every other blank cell is
+    # a cartesian explosion, not a relationship.
+    left_df = left_df[left_df["__excelmcp_key"].notna()]
+    right_df = right_df[right_df["__excelmcp_key"].notna()]
+
+    merged = left_df.merge(
+        right_df,
+        how=join_type,
+        on="__excelmcp_key",
+        suffixes=("_left", "_right"),
+    ).drop(columns="__excelmcp_key")
+
+    total_matched = len(merged)
+    result_df = merged.head(effective_limit)
+    result: dict[str, Any] = {
+        "rows": _records(result_df),
+        "keys": keys_meta,
+        "join_type": join_type,
+        "left": {"file": left_file, "sheet": left_sheet},
+        "right": {"file": right_file, "sheet": right_sheet},
+        "row_count": len(result_df),
+        "total_matched": total_matched,
+        "truncated": total_matched > len(result_df),
+    }
+    drift = [
+        {"file": f, **d}
+        for f, d in ((left_file, left_drift), (right_file, right_drift))
+        if d
+    ]
+    if drift:
+        result["drifted_files"] = drift
+    return result
+
+
+# ------------------------------------------------------------------ derive
+
+
+async def execute_derive(
+    folder_path: str,
+    file_name: str,
+    sheet_name: str,
+    group_by: Any,
+    quantity_col: str,
+    components: list[dict[str, Any]],
+    conditions: Optional[dict[str, Any]] = None,
+) -> dict:
+    """Signed sum over transaction types: the five-call stock calculation in one.
+
+    Each component is {"conditions": {...}, "sign": +1|-1, "label": ...}; the
+    result is sum(sign * groupwise_sum(quantity)) per grouping key, computed in
+    pandas where it is deterministic instead of in the model where it is not.
+    """
+    folder_path = folder_path.rstrip("/")
+    if not isinstance(components, list) or not components:
+        raise ValueError(
+            "components must be a non-empty list of "
+            "{'conditions': {...}, 'sign': 1 or -1, 'label': optional}."
+        )
+    for i, comp in enumerate(components):
+        if not isinstance(comp, dict) or not isinstance(comp.get("conditions"), dict):
+            raise ValueError(f"components[{i}] needs a 'conditions' object.")
+        if comp.get("sign") not in (1, -1):
+            raise ValueError(f"components[{i}] needs 'sign': 1 or -1.")
+
+    group_cols = group_by if isinstance(group_by, list) else [group_by]
+    if not group_cols or not all(isinstance(g, str) and g for g in group_cols):
+        raise ValueError(
+            f"group_by must be a column name or a list of them, got {group_by!r}."
+        )
+
+    _, file_info = _get_file_info(folder_path, file_name)
+    sheet_info = _resolve_sheet(file_info, sheet_name, file_name)
+    df, drift = await _fetch_sheet_data(
+        file_info["item_id"], sheet_name, sheet_info
+    )
+
+    if quantity_col not in df.columns:
+        raise ValueError(
+            f"Column '{quantity_col}' not found. Available: {list(df.columns)}"
+        )
+    missing_groups = [g for g in group_cols if g not in df.columns]
+    if missing_groups:
+        raise ValueError(
+            f"group_by column(s) {missing_groups} not found. "
+            f"Available: {list(df.columns)}"
+        )
+
+    if conditions:
+        df = _apply_conditions(df, conditions)
+    df[quantity_col] = pd.to_numeric(df[quantity_col], errors="coerce")
+
+    net: Optional[pd.Series] = None
+    breakdown = []
+    for i, comp in enumerate(components):
+        part = _apply_conditions(df, comp["conditions"])
+        sums = part.groupby(group_cols)[quantity_col].sum() * comp["sign"]
+        subtotal = float(sums.sum()) if len(sums) else 0.0
+        breakdown.append(
+            {
+                "label": comp.get("label") or f"component_{i}",
+                "sign": comp["sign"],
+                "rows_matched": int(len(part)),
+                "subtotal": subtotal,
+                # A component matching nothing is how a typo'd transaction
+                # type silently zeroes a term — say so explicitly.
+                "matched_no_rows": len(part) == 0,
+            }
+        )
+        net = sums if net is None else net.add(sums, fill_value=0.0)
+
+    result_frame = (net if net is not None else pd.Series(dtype=float)).reset_index()
+    if len(result_frame.columns) == len(group_cols) + 1:
+        result_frame.columns = [*group_cols, "net"]
+
+    response: dict[str, Any] = {
+        "rows": _records(result_frame.head(MAX_ROWS_RETURNED)),
+        "components": breakdown,
+        "quantity_col": quantity_col,
+        "file": file_name,
+        "sheet": sheet_name,
+        "row_count": min(len(result_frame), MAX_ROWS_RETURNED),
+        "truncated": len(result_frame) > MAX_ROWS_RETURNED,
+    }
+    if any(b["matched_no_rows"] for b in breakdown):
+        empty = [b["label"] for b in breakdown if b["matched_no_rows"]]
+        response["warning"] = (
+            f"Component(s) {empty} matched zero rows — their contribution is 0. "
+            f"Check the transaction-type spelling against the sheet's values."
+        )
+    if drift:
+        response["structure_drift"] = drift
+    return response

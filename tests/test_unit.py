@@ -577,6 +577,304 @@ class TestHeaderDetection:
         assert not found
 
 
+# ----------------------------------------------------------- relationships
+
+
+def _sheet_with_samples(columns, sampled):
+    return {"header_row": 1, "columns": columns, "sampled_values": sampled}
+
+
+class TestRelationshipInference:
+    def test_name_match_plus_value_overlap_infers(self):
+        files = {
+            "stock.xlsx": {
+                "sheets": {
+                    "Stock": _sheet_with_samples(
+                        ["Material_ID", "Qty"],
+                        {"Material_ID": ["TiO2", "CaCO3", "ZnO"]},
+                    )
+                }
+            },
+            "prices.xlsx": {
+                "sheets": {
+                    "Prices": _sheet_with_samples(
+                        ["materialid", "Rate"],
+                        {"materialid": ["TiO2", "CaCO3", "NaCl"]},
+                    )
+                }
+            },
+        }
+        rels = structure.infer_relationships(files)
+        assert len(rels) == 1
+        rel = rels[0]
+        assert rel["left"]["column"] == "Material_ID"
+        assert rel["right"]["column"] == "materialid"
+        assert rel["source"] == "inferred"
+        assert rel["confidence"] == pytest.approx(2 / 3, abs=0.01)
+        assert rel["evidence"]["name_token"] == "materialid"
+
+    def test_name_match_without_value_overlap_is_not_a_relationship(self):
+        files = {
+            "a.xlsx": {
+                "sheets": {
+                    "S": _sheet_with_samples(["Code"], {"Code": ["x1", "x2", "x3"]})
+                }
+            },
+            "b.xlsx": {
+                "sheets": {
+                    "T": _sheet_with_samples(["Code"], {"Code": ["y1", "y2", "y3"]})
+                }
+            },
+        }
+        assert structure.infer_relationships(files) == []
+
+    def test_value_overlap_without_name_match_is_not_a_relationship(self):
+        files = {
+            "a.xlsx": {
+                "sheets": {
+                    "S": _sheet_with_samples(
+                        ["Material"], {"Material": ["TiO2", "ZnO"]}
+                    )
+                }
+            },
+            "b.xlsx": {
+                "sheets": {
+                    "T": _sheet_with_samples(["Client"], {"Client": ["TiO2", "ZnO"]})
+                }
+            },
+        }
+        assert structure.infer_relationships(files) == []
+
+
+class TestDeclaredRelationships:
+    def _write(self, tmp_path, monkeypatch, text):
+        path = tmp_path / "relationships.yaml"
+        path.write_text(text, encoding="utf-8")
+        monkeypatch.setattr(structure, "get_relationships_yaml_path", lambda: path)
+        return structure.load_declared_relationships()
+
+    def test_valid_declaration_loads_with_full_confidence(self, tmp_path, monkeypatch):
+        rels = self._write(
+            tmp_path,
+            monkeypatch,
+            "relationships:\n"
+            "  - left:  {file: a.xlsx, sheet: S, column: Material}\n"
+            "    right: {file: b.xlsx, sheet: T, column: Material_ID}\n",
+        )
+        assert len(rels) == 1
+        assert rels[0]["confidence"] == 1.0
+        assert rels[0]["source"] == "declared"
+
+    def test_garbage_yaml_degrades_to_empty(self, tmp_path, monkeypatch):
+        assert self._write(tmp_path, monkeypatch, "{ not: [valid") == []
+
+    def test_malformed_entries_are_skipped(self, tmp_path, monkeypatch):
+        rels = self._write(
+            tmp_path,
+            monkeypatch,
+            "relationships:\n  - left: {file: a.xlsx}\n",
+        )
+        assert rels == []
+
+    def test_missing_file_is_empty(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            structure, "get_relationships_yaml_path", lambda: tmp_path / "nope.yaml"
+        )
+        assert structure.load_declared_relationships() == []
+
+
+# ------------------------------------------------------------------- joins
+
+
+def _join_graph(relationships=None):
+    return {
+        "workspaces": {
+            "/ERP": {
+                "files": {
+                    "stock.xlsx": {
+                        "item_id": "stock",
+                        "sheets": {
+                            "Stock": {"header_row": 1, "columns": ["Material", "Qty"]}
+                        },
+                    },
+                    "prices.xlsx": {
+                        "item_id": "prices",
+                        "sheets": {
+                            "Prices": {
+                                "header_row": 1,
+                                "columns": ["Material_ID", "Rate"],
+                            }
+                        },
+                    },
+                },
+                "relationships": relationships or [],
+            }
+        }
+    }
+
+
+class TestJoinSheets:
+    @pytest.fixture(autouse=True)
+    def patched(self, monkeypatch):
+        self._graph = _join_graph()
+        monkeypatch.setattr(query_engine, "load_graph", lambda: self._graph)
+        monkeypatch.setattr(
+            query_engine, "workspace_relationships",
+            lambda ws: ws.get("relationships", []),
+        )
+
+        frames = {
+            "stock": pd.DataFrame(
+                {"Material": ["TiO2 ", "caco3", "ZnO"], "Qty": [5, 10, 20]}
+            ),
+            "prices": pd.DataFrame(
+                {"Material_ID": ["tio2", "CaCO3", "NaCl"], "Rate": [142.5, 88.0, 3.0]}
+            ),
+        }
+
+        async def fake_fetch(item_id, sheet_name, sheet_info=None):
+            return frames[item_id].copy(), None
+
+        monkeypatch.setattr(query_engine, "_fetch_sheet_data", fake_fetch)
+
+    def _join(self, **kwargs):
+        kwargs.setdefault("folder_path", "/ERP")
+        kwargs.setdefault("left_file", "stock.xlsx")
+        kwargs.setdefault("left_sheet", "Stock")
+        kwargs.setdefault("right_file", "prices.xlsx")
+        kwargs.setdefault("right_sheet", "Prices")
+        return asyncio.run(query_engine.execute_join_sheets(**kwargs))
+
+    def test_explicit_keys_join_with_normalised_matching(self):
+        result = self._join(left_on="Material", right_on="Material_ID")
+        # 'TiO2 ' joins 'tio2', 'caco3' joins 'CaCO3'; ZnO/NaCl drop (inner).
+        assert result["total_matched"] == 2
+        rates = sorted(r["Rate"] for r in result["rows"])
+        assert rates == [88.0, 142.5]
+        assert result["keys"]["source"] == "caller"
+
+    def test_outer_join_keeps_unmatched_rows(self):
+        result = self._join(
+            left_on="Material", right_on="Material_ID", join_type="outer"
+        )
+        assert result["total_matched"] == 4  # 2 matches + ZnO + NaCl
+
+    def test_keys_suggested_from_relationship(self):
+        self._graph = _join_graph(
+            relationships=[
+                {
+                    "left": {"file": "stock.xlsx", "sheet": "Stock", "column": "Material"},
+                    "right": {
+                        "file": "prices.xlsx",
+                        "sheet": "Prices",
+                        "column": "Material_ID",
+                    },
+                    "confidence": 0.8,
+                    "source": "inferred",
+                }
+            ]
+        )
+        result = self._join()
+        assert result["keys"]["left_on"] == "Material"
+        assert result["keys"]["right_on"] == "Material_ID"
+        assert result["keys"]["source"] == "inferred"
+        assert result["total_matched"] == 2
+
+    def test_refuses_to_guess_without_relationship(self):
+        with pytest.raises(ValueError, match="No confident relationship"):
+            self._join()
+
+    def test_unknown_join_column_fails_loud(self):
+        with pytest.raises(ValueError, match="not found"):
+            self._join(left_on="Materiel", right_on="Material_ID")
+
+    def test_unknown_join_type_fails_loud(self):
+        with pytest.raises(ValueError, match="join_type"):
+            self._join(left_on="Material", right_on="Material_ID", join_type="cross")
+
+
+class TestDerive:
+    @pytest.fixture(autouse=True)
+    def patched(self, monkeypatch):
+        graph = {
+            "workspaces": {
+                "/ERP": {
+                    "files": {
+                        "tx.xlsx": {
+                            "item_id": "tx",
+                            "sheets": {
+                                "Transactions": {
+                                    "header_row": 1,
+                                    "columns": ["Material", "Type", "Qty"],
+                                }
+                            },
+                        }
+                    }
+                }
+            }
+        }
+        monkeypatch.setattr(query_engine, "load_graph", lambda: graph)
+
+        async def fake_fetch(item_id, sheet_name, sheet_info=None):
+            return (
+                pd.DataFrame(
+                    {
+                        "Material": ["TiO2", "TiO2", "TiO2", "ZnO"],
+                        "Type": ["Receipt", "Consumption", "Receipt", "Receipt"],
+                        "Qty": [100, 30, 50, 7],
+                    }
+                ),
+                None,
+            )
+
+        monkeypatch.setattr(query_engine, "_fetch_sheet_data", fake_fetch)
+
+    def _derive(self, components, **kwargs):
+        return asyncio.run(
+            query_engine.execute_derive(
+                "/ERP", "tx.xlsx", "Transactions", "Material", "Qty",
+                components, **kwargs,
+            )
+        )
+
+    def test_net_stock_in_one_call(self):
+        result = self._derive(
+            [
+                {"conditions": {"Type": "Receipt"}, "sign": 1, "label": "receipts"},
+                {"conditions": {"Type": "Consumption"}, "sign": -1, "label": "consumption"},
+            ]
+        )
+        by_material = {r["Material"]: r["net"] for r in result["rows"]}
+        assert by_material == {"TiO2": 120.0, "ZnO": 7.0}
+        labels = [c["label"] for c in result["components"]]
+        assert labels == ["receipts", "consumption"]
+        assert result.get("warning") is None
+
+    def test_zero_match_component_is_flagged(self):
+        result = self._derive(
+            [
+                {"conditions": {"Type": "Receipt"}, "sign": 1},
+                {"conditions": {"Type": "Returns"}, "sign": -1, "label": "returns"},
+            ]
+        )
+        flagged = [c for c in result["components"] if c["matched_no_rows"]]
+        assert [c["label"] for c in flagged] == ["returns"]
+        assert "returns" in result["warning"]
+
+    def test_bad_sign_fails_loud(self):
+        with pytest.raises(ValueError, match="sign"):
+            self._derive([{"conditions": {"Type": "Receipt"}, "sign": 2}])
+
+    def test_unknown_quantity_column_fails_loud(self):
+        with pytest.raises(ValueError, match="not found"):
+            asyncio.run(
+                query_engine.execute_derive(
+                    "/ERP", "tx.xlsx", "Transactions", "Material", "Amount",
+                    [{"conditions": {"Type": "Receipt"}, "sign": 1}],
+                )
+            )
+
+
 # --------------------------------------------------- structured conditions
 
 
