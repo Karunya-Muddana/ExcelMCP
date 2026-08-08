@@ -136,9 +136,65 @@ def detect_header_row(used_range_data: dict[str, Any]) -> tuple[int, list[str], 
     return 0, columns_from_row(values[0]), False
 
 
-def generate_sheet_description(file_name: str, sheet_name: str, columns: list[str]) -> str:
+# Value sampling bounds. Sampled values are the one deliberate exception to
+# the "no cell values on disk" guarantee: a handful of distinct labels per
+# low-cardinality column, persisted so that twenty structurally identical
+# workbooks are distinguishable at routing time. They are never served as
+# data — every answer still comes from a live fetch.
+_SAMPLE_ROWS = 500
+_MAX_SAMPLED_CARDINALITY = 50
+_MAX_SAMPLED_VALUE_LEN = 60
+_DESCRIPTION_VALUES_PER_COLUMN = 15
+
+
+def sample_column_values(
+    rows: list[list[Any]], columns: list[str]
+) -> dict[str, list[str]]:
+    """Distinct string values per low-cardinality column, from sampled rows.
+
+    Only textual values count — quantities and serials say nothing about which
+    sheet is which. Columns whose distinct count exceeds the cardinality cap
+    (free text, IDs) are dropped entirely.
+    """
+    sampled: dict[str, list[str]] = {}
+    for col_idx, col_name in enumerate(columns):
+        distinct: dict[str, None] = {}
+        over_cap = False
+        for row in rows:
+            cell = row[col_idx] if col_idx < len(row) else None
+            if not isinstance(cell, str):
+                continue
+            value = " ".join(cell.split())
+            if not value or len(value) > _MAX_SAMPLED_VALUE_LEN:
+                continue
+            distinct[value] = None
+            if len(distinct) > _MAX_SAMPLED_CARDINALITY:
+                over_cap = True
+                break
+        if distinct and not over_cap:
+            sampled[col_name] = sorted(distinct)
+    return sampled
+
+
+def generate_sheet_description(
+    file_name: str,
+    sheet_name: str,
+    columns: list[str],
+    sampled_values: dict[str, list[str]] | None = None,
+) -> str:
+    """Text embedded for routing. Sampled values are what make twenty
+    workbooks with identical schemas distinguishable — without them, cosine
+    similarity between their descriptions approaches 1.0 and routing is
+    effectively random."""
     cols_str = ", ".join(columns)
-    return f"Data sheet '{sheet_name}' in workbook '{file_name}'. Contains columns: {cols_str}."
+    parts = [
+        f"Data sheet '{sheet_name}' in workbook '{file_name}'. "
+        f"Contains columns: {cols_str}."
+    ]
+    for col_name, values in (sampled_values or {}).items():
+        shown = values[:_DESCRIPTION_VALUES_PER_COLUMN]
+        parts.append(f"{col_name} values include: {', '.join(shown)}.")
+    return " ".join(parts)
 
 
 _QUOTED_LITERAL_RE = re.compile(r'"[^"]*"')
@@ -274,6 +330,23 @@ async def _scan_sheet_structure(
         if header_values:
             columns = columns_from_row(header_values)
 
+    sampled_values: dict[str, list[str]] = {}
+    if found:
+        sample_start = row1 + header_idx + 1
+        if sample_start <= row2:
+            sample_address = build_range(
+                col1,
+                sample_start,
+                min(col2, col1 + _SCAN_WINDOW_COLS - 1),
+                min(row2, sample_start + _SAMPLE_ROWS - 1),
+            )
+            sample = await get_range(
+                item_id, sheet_name, sample_address, session_id, select="values"
+            )
+            sampled_values = sample_column_values(
+                sample.get("values", []), columns
+            )
+
     entry: dict[str, Any] = {
         "header_row": header_idx + 1,
         "columns": columns,
@@ -286,6 +359,8 @@ async def _scan_sheet_structure(
     }
     if column_types:
         entry["column_types"] = column_types
+    if sampled_values:
+        entry["sampled_values"] = sampled_values
     return entry
 
 
@@ -347,7 +422,10 @@ async def discover_structure(folder_path: str) -> dict[str, Any]:
                     log(f"[Scan] Sheet '{sheet_name}' in '{file_name}' is empty — skipped.")
                     continue
                 sheet_entry["description"] = generate_sheet_description(
-                    file_name, sheet_name, sheet_entry["columns"]
+                    file_name,
+                    sheet_name,
+                    sheet_entry["columns"],
+                    sheet_entry.get("sampled_values"),
                 )
                 entry["sheets"][sheet_name] = sheet_entry
         except Exception as e:

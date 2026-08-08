@@ -11,6 +11,7 @@ Vectors are L2-normalised at index time, so cosine similarity is a dot product.
 
 import io
 import json
+import re
 from pathlib import Path
 from typing import Any, Optional
 
@@ -125,6 +126,13 @@ def update_embeddings(workspace_path: str, files_dict: dict[str, Any]) -> None:
             if not description:
                 continue
             documents.append(description)
+            # Lexical terms feed the rerank stage: content words from column
+            # names and sampled values. Near-duplicate schemas embed almost
+            # identically, but only the sheet that actually contains "BESTEX"
+            # carries it as a term.
+            terms = _tokens(" ".join(sheet_data.get("columns", [])))
+            for values in sheet_data.get("sampled_values", {}).values():
+                terms |= _tokens(" ".join(values))
             new_metadata.append(
                 {
                     "id": f"{workspace_path}::{filename}::{sheet_name}",
@@ -132,6 +140,7 @@ def update_embeddings(workspace_path: str, files_dict: dict[str, Any]) -> None:
                     "file": filename,
                     "sheet": sheet_name,
                     "description": description,
+                    "lexical_terms": sorted(terms),
                 }
             )
 
@@ -174,8 +183,26 @@ def update_embeddings(workspace_path: str, files_dict: dict[str, Any]) -> None:
     )
 
 
+_WORD_RE = re.compile(r"[a-z0-9]+")
+
+# How many vector hits enter the lexical rerank, and how much a full lexical
+# overlap can add to a cosine score. Reranking is what separates twenty
+# near-identical schemas: their vectors collapse to cosine ~1.0 of each other,
+# but only the right sheet shares the question's literal content words.
+_RERANK_POOL = 20
+_LEXICAL_WEIGHT = 0.3
+
+
+def _tokens(text: str) -> set[str]:
+    return set(_WORD_RE.findall(str(text).lower()))
+
+
 def search(workspace_path: str, query: str, n_results: int = 5) -> list[dict]:
-    """Returns the top n_results sheets in this workspace, most similar first.
+    """Two-stage retrieval: top _RERANK_POOL by cosine, reranked lexically.
+
+    Each result carries `score` (combined), `vector_score`, and
+    `lexical_overlap` (fraction of the query's content words found in the
+    sheet's column names and sampled values).
 
     The workspace filter is applied *before* ranking. It used to run afterwards,
     so with more than one workspace indexed the global top-k could be entirely
@@ -199,15 +226,25 @@ def search(workspace_path: str, query: str, n_results: int = 5) -> list[dict]:
     query_vec = _normalize(np.asarray(embed([query]), dtype=np.float32))[0]
     scores = vectors[candidate_idx] @ query_vec
 
-    k = min(n_results, len(candidate_idx))
-    top = np.argsort(-scores)[:k]
+    pool = min(max(_RERANK_POOL, n_results), len(candidate_idx))
+    top = np.argsort(-scores)[:pool]
 
-    results = []
+    query_tokens = _tokens(query)
+    reranked = []
     for rank in top:
         entry = metadata[candidate_idx[int(rank)]].copy()
-        entry["score"] = float(scores[int(rank)])
-        results.append(entry)
-    return results
+        vector_score = float(scores[int(rank)])
+        terms = set(entry.get("lexical_terms", []))
+        overlap = (
+            len(query_tokens & terms) / len(query_tokens) if query_tokens else 0.0
+        )
+        entry["vector_score"] = vector_score
+        entry["lexical_overlap"] = round(overlap, 4)
+        entry["score"] = vector_score + _LEXICAL_WEIGHT * overlap
+        reranked.append(entry)
+
+    reranked.sort(key=lambda e: -e["score"])
+    return reranked[:n_results]
 
 
 def collection_count(workspace_path: str) -> int:

@@ -330,9 +330,44 @@ def _clamp_limit(limit: Optional[int]) -> int:
     return min(limit, MAX_ROWS_RETURNED)
 
 
-async def execute_query(question: str, folder_path: str) -> dict:
+# Two routed sheets whose combined scores sit within this delta are
+# indistinguishable to the router; the agent should be told, not left to
+# treat an arbitrary pick as a confident one.
+ROUTING_TIE_DELTA = 0.02
+
+
+def _routing_summary(results: list[dict]) -> dict[str, Any]:
+    scores = [r.get("score", 0.0) for r in results]
+    near_ties = [
+        {"file": r["file"], "sheet": r["sheet"], "score": round(r.get("score", 0.0), 4)}
+        for r in results
+        if scores and scores[0] - r.get("score", 0.0) < ROUTING_TIE_DELTA
+    ]
+    ambiguous = len(near_ties) > 1
+    summary: dict[str, Any] = {"routing_ambiguous": ambiguous}
+    if ambiguous:
+        summary["near_ties"] = near_ties
+        summary["note"] = (
+            "The top-ranked sheets scored within a tie margin of each other — "
+            "the routing choice between them is effectively arbitrary. "
+            "Confirm with inspect_file or ask the user which file is meant "
+            "before trusting an answer from just one of them."
+        )
+    return summary
+
+
+async def execute_query(
+    question: str,
+    folder_path: str,
+    n_results: int = 5,
+    min_score: Optional[float] = None,
+) -> dict:
     folder_path = folder_path.rstrip("/")
-    results = search(folder_path, question, n_results=3)
+    if not isinstance(n_results, int) or n_results < 1:
+        raise ValueError(f"n_results must be a positive integer, got {n_results!r}.")
+    results = search(folder_path, question, n_results=min(n_results, 20))
+    if min_score is not None:
+        results = [r for r in results if r.get("score", 0.0) >= min_score]
     if not results:
         return {
             "results": [],
@@ -341,7 +376,8 @@ async def execute_query(question: str, folder_path: str) -> dict:
             "row_count": 0,
             "message": (
                 "No relevant sheets found for this workspace. "
-                "Run scan_workspace first, or check the folder_path."
+                "Run scan_workspace first, check the folder_path, or lower "
+                "min_score."
             ),
         }
 
@@ -402,6 +438,7 @@ async def execute_query(question: str, folder_path: str) -> dict:
 
     return {
         "results": sheet_results,
+        "routing": _routing_summary(results),
         "files": [r["file"] for r in sheet_results],
         "sheets": [r["sheet"] for r in sheet_results],
         "row_count": sum(r["row_count"] for r in sheet_results),

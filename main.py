@@ -230,21 +230,39 @@ async def scan_workspace(folder_path: Optional[str] = None) -> dict:
 @mcp.tool(
     description="""
 Natural language question with automatic RAG routing.
-Embeds your question, finds the most relevant sheets via
-semantic similarity search across the workspace graph,
-fetches them LIVE from OneDrive, returns results.
+Embeds your question, retrieves candidate sheets by
+vector similarity, reranks them by lexical overlap with
+column names and sampled values, fetches the winners
+LIVE from OneDrive, and returns results.
 Use for exploratory questions when you do not know which
 specific file or sheet contains the answer.
-Works universally — no knowledge of the schema needed.
+n_results controls how many sheets are fetched (default
+5); min_score drops weak matches.
+CHECK data.routing: when routing_ambiguous is true the
+top candidates scored within a tie margin and the choice
+between them is effectively arbitrary — confirm with
+inspect_file or ask the user instead of trusting one.
+Including a distinctive literal value in the question
+(a client name, a material) strongly improves routing.
 Response metadata.fetched_at confirms this is live data.
 For known file/sheet combinations use filter_sheet instead.
 """
 )
-async def query(question: str, folder_path: Optional[str] = None) -> dict:
+async def query(
+    question: str,
+    folder_path: Optional[str] = None,
+    n_results: int = 5,
+    min_score: Optional[float] = None,
+) -> dict:
     folder = _resolve_folder(folder_path)
-    result = await execute_query(question, folder)
+    result = await execute_query(question, folder, n_results, min_score)
+    data: dict[str, Any] = {"results": result.get("results", [])}
+    if "routing" in result:
+        data["routing"] = result["routing"]
+    if "message" in result:
+        data["message"] = result["message"]
     return wrap_response(
-        result.get("results", result),
+        data,
         result.get("files", []),
         result.get("sheets", []),
         result.get("row_count", 0),

@@ -718,7 +718,7 @@ class TestScanSheetStructure:
 
         async def fake_get_range(item_id, sheet, address, session=None, **kw):
             calls.append(("range", address))
-            return windows[address]
+            return windows.get(address, {"values": []})
 
         monkeypatch.setattr(structure, "get_used_range", fake_used_range)
         monkeypatch.setattr(structure, "get_range", fake_get_range)
@@ -728,7 +728,10 @@ class TestScanSheetStructure:
         calls = self._fakes(
             monkeypatch,
             meta={"address": "Sheet1!A1:C500", "rowCount": 500, "columnCount": 3},
-            windows={"A1:C10": {"values": [["Name", "Qty", "Status"], ["a", 1, "x"]]}},
+            windows={
+                "A1:C10": {"values": [["Name", "Qty", "Status"], ["a", 1, "x"]]},
+                "A2:C500": {"values": [["a", 1, "Open"], ["b", 2, "Closed"]]},
+            },
         )
         entry = asyncio.run(structure._scan_sheet_structure("i", "S", None))
         assert entry["columns"] == ["Name", "Qty", "Status"]
@@ -736,8 +739,9 @@ class TestScanSheetStructure:
         assert entry["used_range_address"] == "Sheet1!A1:C500"
         assert entry["row_count"] == 500
         assert entry["approx_row_count"] == 499
-        # One metadata call, one window read — never the whole sheet.
-        assert [kind for kind, _ in calls] == ["meta", "range"]
+        assert entry["sampled_values"]["Status"] == ["Closed", "Open"]
+        # Metadata, header window, sampling window — never the whole sheet.
+        assert [kind for kind, _ in calls] == ["meta", "range", "range"]
 
     def test_no_header_in_window_falls_back_to_full_read(self, monkeypatch):
         numeric = {"values": [[1, 2]] * 10}
@@ -750,7 +754,8 @@ class TestScanSheetStructure:
         entry = asyncio.run(structure._scan_sheet_structure("i", "S", None))
         assert entry["columns"] == ["Name", "Qty"]
         assert entry["header_row"] == 12
-        assert [kind for kind, _ in calls] == ["meta", "range", "full"]
+        # Falls back to the full read, then still samples values for routing.
+        assert [kind for kind, _ in calls] == ["meta", "range", "full", "range"]
 
     def test_empty_sheet_returns_none(self, monkeypatch):
         self._fakes(
@@ -900,6 +905,96 @@ class TestEmbeddings:
     def test_empty_descriptions_raise(self, fake_index):
         with pytest.raises(RuntimeError, match="No sheet descriptions"):
             embeddings.update_embeddings("/ERP", {"x.xlsx": {"sheets": {}}})
+
+
+# ------------------------------------------------------- value-level routing
+
+
+class TestValueSampling:
+    def test_distinct_strings_are_collected_sorted(self):
+        rows = [["b", 1], ["a", 2], ["b", 3]]
+        sampled = structure.sample_column_values(rows, ["Client", "Qty"])
+        assert sampled == {"Client": ["a", "b"]}  # Qty is numeric — excluded
+
+    def test_high_cardinality_columns_are_dropped(self):
+        rows = [[f"value-{i}"] for i in range(60)]
+        assert structure.sample_column_values(rows, ["FreeText"]) == {}
+
+    def test_long_values_and_blanks_are_skipped(self):
+        rows = [["x" * 100], [" "], ["ok"]]
+        assert structure.sample_column_values(rows, ["Notes"]) == {"Notes": ["ok"]}
+
+    def test_whitespace_is_collapsed(self):
+        rows = [["BESTEX  Ltd"], ["BESTEX Ltd"]]
+        sampled = structure.sample_column_values(rows, ["Client"])
+        assert sampled == {"Client": ["BESTEX Ltd"]}
+
+    def test_description_folds_in_sampled_values(self):
+        desc = structure.generate_sheet_description(
+            "f.xlsx", "Rates", ["Client", "Rate"], {"Client": ["BESTEX", "Veda"]}
+        )
+        assert "Client values include: BESTEX, Veda." in desc
+
+
+class TestLexicalRerank:
+    def _identical_schema_files(self):
+        # Same description text → identical fake embedding vectors. Only the
+        # sampled values differ, exactly like twenty contract workbooks
+        # sharing one schema.
+        def contract(client):
+            return {
+                "sheets": {
+                    "Rates": {
+                        "description": "same schema either way",
+                        "columns": ["Client", "Rate"],
+                        "sampled_values": {"Client": [client]},
+                    }
+                }
+            }
+
+        return {
+            "CON001_BESTEX.xlsx": contract("BESTEX"),
+            "CON002_GREEN.xlsx": contract("Greenfield Coatings"),
+        }
+
+    def test_rerank_separates_identical_schemas(self, fake_index):
+        embeddings.update_embeddings("/ERP", self._identical_schema_files())
+        results = embeddings.search("/ERP", "contracted rate for BESTEX", n_results=2)
+        assert results[0]["file"] == "CON001_BESTEX.xlsx"
+        assert results[0]["lexical_overlap"] > results[1]["lexical_overlap"]
+        assert results[0]["score"] > results[1]["score"]
+
+    def test_scores_expose_both_stages(self, fake_index):
+        embeddings.update_embeddings("/ERP", self._identical_schema_files())
+        (top, _) = embeddings.search("/ERP", "rate for BESTEX", n_results=2)
+        assert set(top) >= {"score", "vector_score", "lexical_overlap"}
+
+
+class TestRoutingSummary:
+    def test_near_ties_are_flagged_ambiguous(self):
+        summary = query_engine._routing_summary(
+            [
+                {"file": "a.xlsx", "sheet": "S", "score": 0.90},
+                {"file": "b.xlsx", "sheet": "S", "score": 0.895},
+                {"file": "c.xlsx", "sheet": "S", "score": 0.50},
+            ]
+        )
+        assert summary["routing_ambiguous"] is True
+        assert [t["file"] for t in summary["near_ties"]] == ["a.xlsx", "b.xlsx"]
+
+    def test_clear_winner_is_not_ambiguous(self):
+        summary = query_engine._routing_summary(
+            [
+                {"file": "a.xlsx", "sheet": "S", "score": 0.90},
+                {"file": "b.xlsx", "sheet": "S", "score": 0.60},
+            ]
+        )
+        assert summary["routing_ambiguous"] is False
+        assert "near_ties" not in summary
+
+    def test_bad_n_results_raises(self):
+        with pytest.raises(ValueError, match="n_results"):
+            asyncio.run(query_engine.execute_query("q", "/ERP", n_results=0))
 
 
 # ------------------------------------------------------- device-code recovery
