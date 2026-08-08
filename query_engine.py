@@ -7,7 +7,7 @@ import pandas as pd
 from excelmcp.embeddings import search
 from excelmcp.graph_client import GraphAPIError, get_used_range
 from excelmcp.storage import log
-from excelmcp.structure import load_graph
+from excelmcp.structure import fuzzy_name_candidates, load_graph
 
 # Hard ceiling on rows returned by a single tool call. An unfiltered sheet can
 # hold hundreds of thousands of rows; returning them all would blow out the
@@ -389,14 +389,35 @@ async def execute_cross_file_aggregate(
             f"Workspace '{folder_path}' not found. Run scan_workspace first."
         )
 
-    matching = [
-        (fn, fi)
-        for fn, fi in workspace.get("files", {}).items()
-        if sheet_name in fi.get("sheets", {})
-    ]
+    # Files without the exact sheet used to be silently excluded from the
+    # total — no warning, no listing — so a workspace where some files call the
+    # sheet 'Sales' and others 'Sales 2024' produced a confidently wrong total.
+    # They are still excluded (guessing would be worse), but now visibly.
+    matching: list[tuple[str, dict]] = []
+    unmatched_files: list[dict[str, Any]] = []
+    for fn, fi in workspace.get("files", {}).items():
+        sheets = fi.get("sheets", {})
+        if sheet_name in sheets:
+            matching.append((fn, fi))
+        else:
+            entry: dict[str, Any] = {"file": fn, "sheets": list(sheets.keys())}
+            candidates = fuzzy_name_candidates(sheet_name, sheets.keys())
+            if candidates:
+                entry["did_you_mean"] = candidates
+            unmatched_files.append(entry)
+
     if not matching:
+        all_candidates = sorted(
+            {c for u in unmatched_files for c in u.get("did_you_mean", [])}
+        )
+        hint = (
+            f" Close matches in this workspace: {all_candidates}."
+            if all_candidates
+            else ""
+        )
         raise ValueError(
-            f"No files found with sheet '{sheet_name}' in workspace '{folder_path}'."
+            f"No files found with sheet '{sheet_name}' in workspace "
+            f"'{folder_path}'.{hint}"
         )
 
     ops_allowed = {"sum", "mean", "count", "min", "max"}
@@ -463,6 +484,20 @@ async def execute_cross_file_aggregate(
         total = combined[value_col].agg(operation)
 
     warnings: list[str] = []
+    if unmatched_files:
+        with_hints = [u["file"] for u in unmatched_files if u.get("did_you_mean")]
+        hint = (
+            f" Of those, {len(with_hints)} have similarly named sheets "
+            f"(see did_you_mean): {', '.join(with_hints)}."
+            if with_hints
+            else ""
+        )
+        warnings.append(
+            f"{len(unmatched_files)} file(s) in this workspace have no sheet "
+            f"named '{sheet_name}' and are NOT included in this total: "
+            + ", ".join(u["file"] for u in unmatched_files)
+            + f".{hint} The total may be incomplete — check unmatched_files."
+        )
     if failures:
         warnings.append(
             f"{len(failures)} file(s) skipped due to live fetch errors: "
@@ -484,5 +519,6 @@ async def execute_cross_file_aggregate(
         "sheet": sheet_name,
         "row_count": len(combined),
         "skipped_files": failures,
+        "unmatched_files": unmatched_files,
         "warning": " ".join(warnings) if warnings else None,
     }

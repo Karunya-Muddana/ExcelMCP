@@ -179,6 +179,98 @@ class TestConditions:
         assert out["Qty"].tolist() == [20, 300]
 
 
+# ------------------------------------------------- cross-file completeness
+
+
+def _variant_workspace():
+    """Five files: three name the sheet 'Sales', two name it 'Sales 2024'."""
+    files = {}
+    for i in range(3):
+        files[f"F{i}.xlsx"] = {
+            "item_id": f"id{i}",
+            "sheets": {"Sales": {"header_row": 1, "columns": ["Client", "Amount"]}},
+        }
+    for i in range(3, 5):
+        files[f"F{i}.xlsx"] = {
+            "item_id": f"id{i}",
+            "sheets": {"Sales 2024": {"header_row": 1, "columns": ["Client", "Amount"]}},
+        }
+    return {"workspaces": {"/ERP": {"files": files}}}
+
+
+class TestCrossFileCompleteness:
+    @pytest.fixture(autouse=True)
+    def patched(self, monkeypatch):
+        monkeypatch.setattr(query_engine, "load_graph", _variant_workspace)
+
+        async def fake_fetch(item_id, sheet_name, header_row=1, **kwargs):
+            return pd.DataFrame({"Client": ["A", "B"], "Amount": [100, 100]})
+
+        monkeypatch.setattr(query_engine, "_fetch_sheet_data", fake_fetch)
+
+    def _run(self, sheet):
+        return asyncio.run(
+            query_engine.execute_cross_file_aggregate("/ERP", sheet, "Amount", "sum")
+        )
+
+    def test_unmatched_files_are_reported_not_hidden(self):
+        # These two files were previously excluded with no signal at all —
+        # the README's "visibly partial" claim was false.
+        result = self._run("Sales")
+        assert [u["file"] for u in result["unmatched_files"]] == ["F3.xlsx", "F4.xlsx"]
+        assert all(u["sheets"] == ["Sales 2024"] for u in result["unmatched_files"])
+
+    def test_warning_names_the_excluded_files(self):
+        result = self._run("Sales")
+        assert result["warning"] is not None
+        assert "NOT included" in result["warning"]
+        assert "F3.xlsx" in result["warning"] and "F4.xlsx" in result["warning"]
+
+    def test_fuzzy_matches_are_suggested_never_included(self):
+        result = self._run("Sales")
+        assert result["total"] == 600.0  # never 1000 — suggestions don't count
+        for u in result["unmatched_files"]:
+            assert "Sales 2024" in u["did_you_mean"]
+
+    def test_exact_match_everywhere_yields_no_warning(self):
+        result = self._run("Sales 2024")
+        # Files with only 'Sales' are unmatched, but the ones asked about work.
+        assert result["total"] == 400.0
+        assert len(result["unmatched_files"]) == 3
+
+    def test_no_match_anywhere_raises_with_candidates(self):
+        with pytest.raises(ValueError) as exc:
+            self._run("Salez")
+        assert "Sales" in str(exc.value)
+
+
+class TestNameNormalisation:
+    def test_case_and_whitespace_collapse(self):
+        assert structure.normalise_name("  Sales  2024 ") == "sales 2024"
+        assert structure.normalise_name("SALES") == structure.normalise_name("sales ")
+
+    def test_fuzzy_catches_containment(self):
+        assert "Sales 2024" in structure.fuzzy_name_candidates(
+            "Sales", ["Sales 2024", "Costs"]
+        )
+
+    def test_fuzzy_catches_small_typos(self):
+        assert "Sales" in structure.fuzzy_name_candidates("Slaes", ["Sales", "Costs"])
+
+    def test_fuzzy_rejects_unrelated_names(self):
+        assert structure.fuzzy_name_candidates("Sales", ["Inventory", "HR"]) == []
+
+    def test_variants_groups_only_fragmented_names(self):
+        files = {
+            "a.xlsx": {"sheets": {"Sales": {}}},
+            "b.xlsx": {"sheets": {"sales ": {}}},
+            "c.xlsx": {"sheets": {"Costs": {}}},
+        }
+        variants = structure.sheet_name_variants(files)
+        assert set(variants) == {"sales"}
+        assert variants["sales"] == {"Sales": ["a.xlsx"], "sales ": ["b.xlsx"]}
+
+
 # ------------------------------------------------------------ JSON safety
 
 

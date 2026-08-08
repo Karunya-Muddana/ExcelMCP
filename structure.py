@@ -1,7 +1,8 @@
+import difflib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from excelmcp.graph_client import (
     close_session,
@@ -31,6 +32,59 @@ def load_graph() -> dict[str, Any]:
 
 def save_graph(graph: dict[str, Any]) -> None:
     atomic_write_text(get_graph_path(), json.dumps(graph, indent=2))
+
+
+def normalise_name(name: Any) -> str:
+    """Case- and whitespace-insensitive form of a sheet or column name.
+
+    'Sales ', 'sales' and 'SALES' all normalise to 'sales'. Used to detect the
+    near-miss naming that makes cross-file operations silently partial.
+    """
+    return " ".join(str(name).split()).casefold()
+
+
+def fuzzy_name_candidates(
+    target: str, names: Iterable[str], limit: int = 3
+) -> list[str]:
+    """Names that plausibly mean the same thing as target, best match first.
+
+    Catches three kinds of drift: pure case/whitespace variants ('sales '),
+    containment ('Sales 2024' for 'Sales'), and small typos ('Slaes'). These
+    are *suggestions only* — callers must never fold a fuzzy match into a
+    result as if it were the real thing.
+    """
+    target_n = normalise_name(target)
+    if not target_n:
+        return []
+    scored: list[tuple[float, str]] = []
+    for name in names:
+        name_n = normalise_name(name)
+        ratio = difflib.SequenceMatcher(None, target_n, name_n).ratio()
+        if (
+            name_n == target_n
+            or target_n in name_n
+            or name_n in target_n
+            or ratio >= 0.75
+        ):
+            scored.append((ratio, name))
+    scored.sort(key=lambda pair: -pair[0])
+    return [name for _, name in scored[:limit]]
+
+
+def sheet_name_variants(files: dict[str, Any]) -> dict[str, dict[str, list[str]]]:
+    """Groups of sheet names across a workspace that normalise to the same string.
+
+    Returns {normalised: {raw_spelling: [files using it]}} for every group with
+    more than one raw spelling — the fragmentation an agent should see *before*
+    it runs a cross-file aggregate.
+    """
+    groups: dict[str, dict[str, list[str]]] = {}
+    for file_name, file_info in files.items():
+        for sheet_name in file_info.get("sheets", {}):
+            groups.setdefault(normalise_name(sheet_name), {}).setdefault(
+                sheet_name, []
+            ).append(file_name)
+    return {norm: variants for norm, variants in groups.items() if len(variants) > 1}
 
 
 def _deduplicate_columns(columns: list[str]) -> list[str]:

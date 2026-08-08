@@ -13,7 +13,7 @@ from excelmcp.query_engine import (
     execute_inspect_file,
     execute_query,
 )
-from excelmcp.structure import discover_structure, load_graph
+from excelmcp.structure import discover_structure, load_graph, sheet_name_variants
 
 mcp = FastMCP(
     "ExcelMCP",
@@ -146,12 +146,16 @@ def wrap_response(
 @mcp.tool(
     description="""
 Returns the cached file structure — all filenames, sheet
-names, column headers, and cross-file relationships.
+names, and column headers.
 INSTANT — makes no API call. Reads from local graph.json.
 ALWAYS call this first at session start to orient yourself.
 Shows you exactly which files exist, what sheets they have,
 and what columns are in each sheet. The structure varies
 for every company — never assume, always discover.
+Also returns sheet_name_variants: groups of sheet names
+that differ only in case or whitespace across files —
+check it before any cross-file operation, because those
+match by exact sheet name.
 Use this before any filter_sheet call when unsure which
 file or column to query.
 """
@@ -172,7 +176,11 @@ async def get_workspace_graph(folder_path: Optional[str] = None) -> dict:
             0,
         )
     file_names = list(workspace.get("files", {}).keys())
-    return wrap_response(workspace, file_names, [], 0)
+    data = dict(workspace)
+    # Sheet-name fragmentation ('Sales' vs 'sales ' vs 'SALES') silently
+    # shrinks cross-file totals; surface it before the agent aggregates.
+    data["sheet_name_variants"] = sheet_name_variants(workspace.get("files", {}))
+    return wrap_response(data, file_names, [], 0)
 
 
 @mcp.tool(
@@ -334,10 +342,16 @@ NEVER calculate cross-file totals by:
 
 Always call this AND show per-file breakdown so the
 user can verify both agree. If they differ, flag it.
-If the response has a warning or skipped_files, surface
-that to the user — the total is incomplete.
-Works universally — discovers relevant files via the
-workspace graph automatically.
+
+ONLY files whose sheet is named EXACTLY `sheet` are
+included in the total. Files without that exact sheet
+are listed in unmatched_files, with their actual sheet
+names and did_you_mean candidates — they are NEVER
+silently included. If the response has a warning,
+skipped_files, or unmatched_files, surface that to the
+user: the total may be incomplete. Check
+sheet_name_variants in get_workspace_graph first to see
+naming fragmentation before aggregating.
 """
 )
 async def cross_file_aggregate(
@@ -358,6 +372,7 @@ async def cross_file_aggregate(
             "column": result["column"],
             "per_file": result["per_file"],
             "skipped_files": result.get("skipped_files", []),
+            "unmatched_files": result.get("unmatched_files", []),
             "warning": result.get("warning"),
         },
         result["files"],
