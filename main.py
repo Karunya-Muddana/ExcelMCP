@@ -184,7 +184,35 @@ async def get_workspace_graph(folder_path: Optional[str] = None) -> dict:
     # Sheet-name fragmentation ('Sales' vs 'sales ' vs 'SALES') silently
     # shrinks cross-file totals; surface it before the agent aggregates.
     data["sheet_name_variants"] = sheet_name_variants(workspace.get("files", {}))
+    scan_age = _scan_age(workspace.get("files", {}))
+    if scan_age:
+        data["scan_age"] = scan_age
     return wrap_response(data, file_names, [], 0)
+
+
+def _scan_age(files: dict) -> Optional[dict]:
+    """Age of the oldest scan in the workspace — 'scanned 47 days ago' is
+    information the agent should act on, not something buried in per-file
+    timestamps."""
+    stamps = [f.get("last_scanned", "") for f in files.values() if f.get("last_scanned")]
+    if not stamps:
+        return None
+    oldest = min(stamps)
+    try:
+        scanned_at = datetime.fromisoformat(oldest)
+    except ValueError:
+        return None
+    if scanned_at.tzinfo is None:
+        scanned_at = scanned_at.replace(tzinfo=timezone.utc)
+    days = max(0, (datetime.now(timezone.utc) - scanned_at).days)
+    age: dict[str, Any] = {"oldest_last_scanned": oldest, "days_ago": days}
+    if days >= 14:
+        age["note"] = (
+            f"The structure index is {days} days old. Sheets renamed or "
+            "restructured since then will mis-resolve; consider asking the "
+            "user whether to run scan_workspace."
+        )
+    return age
 
 
 @mcp.tool(
@@ -319,8 +347,9 @@ async def filter_sheet(
         "total_matched": result["total_matched"],
         "truncated": result["truncated"],
     }
-    if "zero_match_diagnostics" in result:
-        data["zero_match_diagnostics"] = result["zero_match_diagnostics"]
+    for extra in ("zero_match_diagnostics", "structure_drift"):
+        if extra in result:
+            data[extra] = result[extra]
     return wrap_response(
         data,
         [result["file"]],
@@ -358,8 +387,9 @@ async def aggregate(
         file_name, sheet, group_by, value_col, operation, conditions, folder
     )
     data = {"rows": result["rows"], "truncated": result["truncated"]}
-    if "zero_match_diagnostics" in result:
-        data["zero_match_diagnostics"] = result["zero_match_diagnostics"]
+    for extra in ("zero_match_diagnostics", "structure_drift"):
+        if extra in result:
+            data[extra] = result[extra]
     return wrap_response(
         data,
         [result["file"]],
@@ -417,6 +447,7 @@ async def cross_file_aggregate(
             "per_file": result["per_file"],
             "skipped_files": result.get("skipped_files", []),
             "unmatched_files": result.get("unmatched_files", []),
+            "drifted_files": result.get("drifted_files", []),
             "warning": result.get("warning"),
         },
         result["files"],

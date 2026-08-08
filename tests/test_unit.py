@@ -314,11 +314,11 @@ class TestCrossFileFold:
             query_engine, "load_graph", lambda: _fold_workspace(n_files)
         )
 
-        async def fake_fetch(item_id, sheet_name, header_row=1, column_types=None):
+        async def fake_fetch(item_id, sheet_name, sheet_info=None):
             frame = frames_by_item[item_id]
             if isinstance(frame, Exception):
                 raise frame
-            return frame.copy()
+            return frame.copy(), None
 
         monkeypatch.setattr(query_engine, "_fetch_sheet_data", fake_fetch)
 
@@ -435,8 +435,8 @@ class TestCrossFileCompleteness:
     def patched(self, monkeypatch):
         monkeypatch.setattr(query_engine, "load_graph", _variant_workspace)
 
-        async def fake_fetch(item_id, sheet_name, header_row=1, column_types=None):
-            return pd.DataFrame({"Client": ["A", "B"], "Amount": [100, 100]})
+        async def fake_fetch(item_id, sheet_name, sheet_info=None):
+            return pd.DataFrame({"Client": ["A", "B"], "Amount": [100, 100]}), None
 
         monkeypatch.setattr(query_engine, "_fetch_sheet_data", fake_fetch)
 
@@ -575,6 +575,54 @@ class TestHeaderDetection:
         idx, cols, found = structure.detect_header_row(data)
         assert idx == 0
         assert not found
+
+
+# --------------------------------------------------------- structure drift
+
+
+class TestStructureDrift:
+    def test_matching_header_reports_no_drift(self):
+        report = query_engine._drift_report(
+            ["Name", "Qty"], {"columns": ["Name", "Qty"]}
+        )
+        assert report is None
+
+    def test_changed_header_reports_both_versions(self):
+        report = query_engine._drift_report(
+            ["Inserted", "Name", "Qty"], {"columns": ["Name", "Qty"]}
+        )
+        assert report["structure_drift"] is True
+        assert report["stored_header"] == ["Name", "Qty"]
+        assert report["live_header"] == ["Inserted", "Name", "Qty"]
+        assert "scan_workspace" in report["recommendation"]
+
+    def test_unscanned_sheet_cannot_drift(self):
+        assert query_engine._drift_report(["A"], {}) is None
+        assert query_engine._drift_report(["A"], None) is None
+
+    def test_fetch_flags_drift_but_still_answers(self, monkeypatch):
+        async def fake_used_range(item_id, sheet_name, *args, **kwargs):
+            return {"values": [["Renamed", "Qty"], ["a", 1]]}
+
+        monkeypatch.setattr(query_engine, "get_used_range", fake_used_range)
+        df, drift = asyncio.run(
+            query_engine._fetch_sheet_data(
+                "i", "S", {"header_row": 1, "columns": ["Name", "Qty"]}
+            )
+        )
+        assert drift["structure_drift"] is True
+        assert list(df.columns) == ["Renamed", "Qty"]  # live header wins
+        assert len(df) == 1
+
+    def test_fetch_uses_scan_style_column_names(self, monkeypatch):
+        # Blank headers must get the same positional names the graph shows
+        # ('Column_1'), not a different scheme the agent has never seen.
+        async def fake_used_range(item_id, sheet_name, *args, **kwargs):
+            return {"values": [["Name", "", "Qty"], ["a", "x", 1]]}
+
+        monkeypatch.setattr(query_engine, "get_used_range", fake_used_range)
+        df, _ = asyncio.run(query_engine._fetch_sheet_data("i", "S", {"header_row": 1}))
+        assert list(df.columns) == ["Name", "Column_1", "Qty"]
 
 
 # ------------------------------------------------------------ serial dates

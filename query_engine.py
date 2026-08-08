@@ -9,7 +9,7 @@ import pandas as pd
 from excelmcp.embeddings import search
 from excelmcp.graph_client import GraphAPIError, get_used_range
 from excelmcp.storage import log
-from excelmcp.structure import fuzzy_name_candidates, load_graph
+from excelmcp.structure import columns_from_row, fuzzy_name_candidates, load_graph
 
 # Hard ceiling on rows returned by a single tool call. An unfiltered sheet can
 # hold hundreds of thousands of rows; returning them all would blow out the
@@ -90,25 +90,54 @@ def _convert_date_columns(
     return df
 
 
+def _drift_report(
+    live_headers: list[str], sheet_info: Optional[dict[str, Any]]
+) -> Optional[dict[str, Any]]:
+    """Compares the freshly read header row against the scan-time fingerprint.
+
+    graph.json stores header_row from scan time; a row inserted above the
+    header in OneDrive shifts the used range and the cached index then points
+    at a data row. The mismatch is only loud when it produces garbage column
+    names — this makes it loud always.
+    """
+    stored = (sheet_info or {}).get("columns")
+    if not stored or live_headers == stored:
+        return None
+    return {
+        "structure_drift": True,
+        "stored_header": stored,
+        "live_header": live_headers,
+        "recommendation": (
+            "The sheet's header row no longer matches the structure captured "
+            "at scan time — the sheet was probably edited. Results below use "
+            "the live header, but run scan_workspace to refresh the index."
+        ),
+    }
+
+
 async def _fetch_sheet_data(
     item_id: str,
     sheet_name: str,
-    header_row: int = 1,
-    column_types: Optional[dict[str, str]] = None,
-) -> pd.DataFrame:
-    """Fetches live data from Graph API and returns a DataFrame. Never reads from cache."""
+    sheet_info: Optional[dict[str, Any]] = None,
+) -> tuple[pd.DataFrame, Optional[dict[str, Any]]]:
+    """Fetches live data and returns (frame, drift_report). Never reads from cache.
+
+    sheet_info is the sheet's graph entry: header_row positions the header,
+    column_types drives serial-date conversion, columns is the drift
+    fingerprint.
+    """
+    sheet_info = sheet_info or {}
+    header_row = sheet_info.get("header_row", 1)
     data = await get_used_range(item_id, sheet_name)
     values = data.get("values", [])
     if not values or len(values) < header_row:
-        return pd.DataFrame()
+        return pd.DataFrame(), None
 
     header_idx = header_row - 1
-    headers = _deduplicate_headers(
-        [
-            str(c).strip() if c is not None and str(c).strip() else f"Col{i}"
-            for i, c in enumerate(values[header_idx])
-        ]
-    )
+    # Same normalisation as scan-time discovery, so the frame's column names
+    # always match what get_workspace_graph told the agent.
+    headers = columns_from_row(values[header_idx])
+    drift = _drift_report(headers, sheet_info)
 
     data_rows = values[header_idx + 1:]
     padded: list[list[Any]] = []
@@ -119,20 +148,10 @@ async def _fetch_sheet_data(
             row = row[: len(headers)]
         padded.append(row)
 
-    return _convert_date_columns(pd.DataFrame(padded, columns=headers), column_types)
-
-
-def _deduplicate_headers(headers: list[str]) -> list[str]:
-    seen: dict[str, int] = {}
-    result: list[str] = []
-    for h in headers:
-        if h in seen:
-            seen[h] += 1
-            result.append(f"{h}_{seen[h]}")
-        else:
-            seen[h] = 0
-            result.append(h)
-    return result
+    df = _convert_date_columns(
+        pd.DataFrame(padded, columns=headers), sheet_info.get("column_types")
+    )
+    return df, drift
 
 
 def _date_compare(df: pd.DataFrame, col: str, bound: str, op: str) -> pd.DataFrame:
@@ -400,13 +419,8 @@ async def execute_query(
                          "structure graph. Run scan_workspace.",
             }
         sheet_info = file_info.get("sheets", {}).get(sheet_name, {})
-        df = await _fetch_sheet_data(
-            item_id,
-            sheet_name,
-            sheet_info.get("header_row", 1),
-            sheet_info.get("column_types"),
-        )
-        return {
+        df, drift = await _fetch_sheet_data(item_id, sheet_name, sheet_info)
+        result = {
             "file": file_name,
             "sheet": sheet_name,
             "score": meta.get("score", 0),
@@ -414,6 +428,9 @@ async def execute_query(
             "row_count": len(df),
             "truncated": len(df) > QUERY_ROWS_PER_SHEET,
         }
+        if drift:
+            result["structure_drift"] = drift
+        return result
 
     raw = await asyncio.gather(
         *[fetch_and_format(m) for m in results], return_exceptions=True
@@ -486,11 +503,8 @@ async def execute_filter_sheet(
     effective_limit = _clamp_limit(limit)
     _, file_info = _get_file_info(folder_path, file_name)
     sheet_info = _resolve_sheet(file_info, sheet_name, file_name)
-    full_df = await _fetch_sheet_data(
-        file_info["item_id"],
-        sheet_name,
-        sheet_info.get("header_row", 1),
-        sheet_info.get("column_types"),
+    full_df, drift = await _fetch_sheet_data(
+        file_info["item_id"], sheet_name, sheet_info
     )
 
     df = full_df
@@ -518,6 +532,8 @@ async def execute_filter_sheet(
         result["zero_match_diagnostics"] = _zero_match_diagnostics(
             full_df, conditions, exact_case
         )
+    if drift:
+        result["structure_drift"] = drift
     return result
 
 
@@ -533,11 +549,8 @@ async def execute_aggregate(
     folder_path = folder_path.rstrip("/")
     _, file_info = _get_file_info(folder_path, file_name)
     sheet_info = _resolve_sheet(file_info, sheet_name, file_name)
-    full_df = await _fetch_sheet_data(
-        file_info["item_id"],
-        sheet_name,
-        sheet_info.get("header_row", 1),
-        sheet_info.get("column_types"),
+    full_df, drift = await _fetch_sheet_data(
+        file_info["item_id"], sheet_name, sheet_info
     )
 
     df = full_df
@@ -569,6 +582,8 @@ async def execute_aggregate(
         response["zero_match_diagnostics"] = _zero_match_diagnostics(
             full_df, conditions
         )
+    if drift:
+        response["structure_drift"] = drift
     return response
 
 
@@ -627,17 +642,14 @@ async def execute_cross_file_aggregate(
     async def fetch_file(file_name: str, file_info: dict):
         try:
             sheet_info = file_info["sheets"][sheet_name]
-            df = await _fetch_sheet_data(
-                file_info["item_id"],
-                sheet_name,
-                sheet_info.get("header_row", 1),
-                sheet_info.get("column_types"),
+            df, drift = await _fetch_sheet_data(
+                file_info["item_id"], sheet_name, sheet_info
             )
             if conditions:
                 df = _apply_conditions(df, conditions)
-            return file_name, df, None
+            return file_name, df, drift, None
         except Exception as exc:
-            return file_name, None, exc
+            return file_name, None, None, exc
 
     # Results are folded incrementally as each file completes: one frame is
     # held at a time instead of concatenating all of them. For mean, (sum,
@@ -647,6 +659,7 @@ async def execute_cross_file_aggregate(
     per_file: dict[str, Any] = {}
     failures: list[dict[str, str]] = []
     missing_col: list[str] = []
+    drifted: list[dict[str, Any]] = []
     total_sum = 0.0
     total_count = 0
     running_min: Optional[float] = None
@@ -656,11 +669,13 @@ async def execute_cross_file_aggregate(
     for future in asyncio.as_completed(
         [fetch_file(fn, fi) for fn, fi in matching]
     ):
-        file_name, df, exc = await future
+        file_name, df, drift, exc = await future
         if exc is not None:
             failures.append({"file": file_name, "error": str(exc)})
             log(f"[Warning] Skipped {file_name}: {exc}")
             continue
+        if drift:
+            drifted.append({"file": file_name, **drift})
         if value_col not in df.columns:
             missing_col.append(file_name)
             continue
@@ -716,6 +731,7 @@ async def execute_cross_file_aggregate(
     }
     failures.sort(key=lambda f: file_order[f["file"]])
     missing_col.sort(key=lambda fn: file_order[fn])
+    drifted.sort(key=lambda d: file_order[d["file"]])
 
     warnings: list[str] = []
     if unmatched_files:
@@ -754,5 +770,6 @@ async def execute_cross_file_aggregate(
         "row_count": row_count,
         "skipped_files": failures,
         "unmatched_files": unmatched_files,
+        "drifted_files": drifted,
         "warning": " ".join(warnings) if warnings else None,
     }
