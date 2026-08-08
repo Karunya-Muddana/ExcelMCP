@@ -1,6 +1,7 @@
 import asyncio
 import difflib
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -140,6 +141,64 @@ def generate_sheet_description(file_name: str, sheet_name: str, columns: list[st
     return f"Data sheet '{sheet_name}' in workbook '{file_name}'. Contains columns: {cols_str}."
 
 
+_QUOTED_LITERAL_RE = re.compile(r'"[^"]*"')
+_BRACKET_SECTION_RE = re.compile(r"\[[^\]]*\]")
+
+
+def is_date_number_format(fmt: Any) -> bool:
+    """True when an Excel number format renders a date or time.
+
+    Date/time formats use y/m/d/h/s tokens ('m/d/yyyy', 'dd-mmm-yy hh:mm');
+    numeric formats use 0/#/? placeholders. Quoted literals and [] sections
+    (colors, locales, elapsed-time) are stripped first so '"day" 0' or
+    '[$-409]d-mmm' classify by their real tokens.
+    """
+    if not fmt or not isinstance(fmt, str):
+        return False
+    cleaned = _BRACKET_SECTION_RE.sub("", _QUOTED_LITERAL_RE.sub("", fmt))
+    # A format can carry ';'-separated sections (positive;negative;zero;text).
+    # 'd-mmm;@' is a date format with a text fallback — classify per section.
+    for section in cleaned.split(";"):
+        lowered = section.lower()
+        if "general" in lowered or "@" in section:
+            continue
+        if any(placeholder in section for placeholder in ("0", "#", "?")):
+            continue
+        if any(token in lowered for token in ("y", "m", "d", "h", "s")):
+            return True
+    return False
+
+
+def detect_date_columns(
+    values: list[list[Any]],
+    number_formats: list[list[Any]],
+    header_idx: int,
+    columns: list[str],
+) -> dict[str, str]:
+    """Maps column name -> 'date' for columns whose cells carry date formats.
+
+    Looks at the first non-empty data cell below the header in each column.
+    Excel stores dates as serial floats; the numberFormat is the only signal
+    that distinguishes a date column from a plain numeric one.
+    """
+    column_types: dict[str, str] = {}
+    data_rows = range(header_idx + 1, len(values))
+    for col_idx, col_name in enumerate(columns):
+        for row_idx in data_rows:
+            row = values[row_idx] if row_idx < len(values) else []
+            cell = row[col_idx] if col_idx < len(row) else None
+            if cell is None or (isinstance(cell, str) and not cell.strip()):
+                continue
+            fmt_row = (
+                number_formats[row_idx] if row_idx < len(number_formats) else []
+            )
+            fmt = fmt_row[col_idx] if col_idx < len(fmt_row) else None
+            if is_date_number_format(fmt):
+                column_types[col_name] = "date"
+            break
+    return column_types
+
+
 # Header detection reads a bounded window rather than the whole sheet: ten
 # rows is where real headers live (title rows above them are rare and short),
 # and 52 columns (A..AZ) covers the window; wider sheets get their header row
@@ -174,8 +233,26 @@ async def _scan_sheet_structure(
         min(col2, col1 + _SCAN_WINDOW_COLS - 1),
         min(row2, row1 + _HEADER_WINDOW_ROWS - 1),
     )
-    window = await get_range(item_id, sheet_name, window_address, session_id)
+    window = await get_range(
+        item_id,
+        sheet_name,
+        window_address,
+        session_id,
+        select="values,numberFormat",
+    )
     header_idx, columns, found = detect_header_row(window)
+
+    column_types: dict[str, str] = {}
+    if found:
+        # numberFormat is only fetched for the window; if the header lives
+        # beyond it (rare), date detection is skipped rather than paying for
+        # formats on a full-sheet read.
+        column_types = detect_date_columns(
+            window.get("values", []),
+            window.get("numberFormat", []),
+            header_idx,
+            columns,
+        )
 
     if not found and row_count > _HEADER_WINDOW_ROWS:
         full = await get_used_range(item_id, sheet_name, session_id)
@@ -197,7 +274,7 @@ async def _scan_sheet_structure(
         if header_values:
             columns = columns_from_row(header_values)
 
-    return {
+    entry: dict[str, Any] = {
         "header_row": header_idx + 1,
         "columns": columns,
         "used_range_address": address,
@@ -207,6 +284,9 @@ async def _scan_sheet_structure(
         # size without a live call. Labelled as_of_last_scan where surfaced.
         "approx_row_count": max(0, row_count - header_idx - 1),
     }
+    if column_types:
+        entry["column_types"] = column_types
+    return entry
 
 
 async def discover_structure(folder_path: str) -> dict[str, Any]:

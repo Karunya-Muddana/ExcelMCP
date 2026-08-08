@@ -79,11 +79,15 @@ different real-world things. Never add them together
 unless the user explicitly asks for a combined total,
 and even then use cross_file_aggregate not mental math.
 
-RULE 9 — DATE VALUES MAY BE EXCEL SERIALS
-Dates stored as numbers in Excel are serial values.
-Convert using Python after fetching if needed:
-  from datetime import date, timedelta
-  real_date = date(1899, 12, 30) + timedelta(days=serial)
+RULE 9 — DATE COLUMNS ARRIVE AS ISO-8601 STRINGS
+Columns detected as dates at scan time are converted
+from Excel serials to ISO-8601 strings ("2026-03-15")
+by the server before you see them. Use ISO literals in
+conditions: {"Batch Date": ">=2026-01-01"} works
+directly. Never do serial-to-date arithmetic yourself.
+If a column looks like raw serials (plain floats near
+45000), it was not detected as a date — say so rather
+than converting by hand, and suggest scan_workspace.
 
 RULE 10 — TRANSACTION-BASED DATA NEEDS TYPE FILTERING
 If a workspace has transaction-based tracking (receipts,

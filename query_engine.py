@@ -1,5 +1,7 @@
 import asyncio
 import math
+import re
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 import pandas as pd
@@ -39,7 +41,61 @@ def _records(df: pd.DataFrame) -> list[dict[str, Any]]:
     return records
 
 
-async def _fetch_sheet_data(item_id: str, sheet_name: str, header_row: int = 1) -> pd.DataFrame:
+# Excel serials count days from this epoch (the 1900 system with its
+# deliberate Lotus-compat off-by-two).
+_EXCEL_EPOCH = datetime(1899, 12, 30)
+
+# Matches an ISO date or datetime literal: 2026-01-01, 2026-01-01T09:30, ...
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}([T ].*)?$")
+
+
+def _serial_to_iso(value: Any) -> Any:
+    """Converts one Excel serial to an ISO-8601 string; non-numerics pass through.
+
+    A whole-day serial becomes a date ('2026-03-15'); a fractional one keeps
+    its time part ('2026-03-15T09:30:00'). Values that cannot be a date
+    (text, None, out-of-range numbers) are returned unchanged rather than
+    guessed at.
+    """
+    if value is None or isinstance(value, bool):
+        return value
+    try:
+        serial = float(value)
+    except (TypeError, ValueError):
+        return value
+    if not math.isfinite(serial):
+        return value
+    try:
+        moment = _EXCEL_EPOCH + timedelta(days=serial)
+    except OverflowError:
+        return value
+    if abs(serial - round(serial)) < 1e-9:
+        return moment.date().isoformat()
+    return moment.replace(microsecond=0).isoformat()
+
+
+def _convert_date_columns(
+    df: pd.DataFrame, column_types: Optional[dict[str, str]]
+) -> pd.DataFrame:
+    """Rewrites serial-date columns as ISO-8601 strings before the agent sees them.
+
+    Models doing serial-to-date arithmetic by hand is an observed source of
+    fabricated dates; the conversion belongs here, deterministically.
+    """
+    if not column_types:
+        return df
+    for col, col_type in column_types.items():
+        if col_type == "date" and col in df.columns:
+            df[col] = df[col].map(_serial_to_iso)
+    return df
+
+
+async def _fetch_sheet_data(
+    item_id: str,
+    sheet_name: str,
+    header_row: int = 1,
+    column_types: Optional[dict[str, str]] = None,
+) -> pd.DataFrame:
     """Fetches live data from Graph API and returns a DataFrame. Never reads from cache."""
     data = await get_used_range(item_id, sheet_name)
     values = data.get("values", [])
@@ -63,7 +119,7 @@ async def _fetch_sheet_data(item_id: str, sheet_name: str, header_row: int = 1) 
             row = row[: len(headers)]
         padded.append(row)
 
-    return pd.DataFrame(padded, columns=headers)
+    return _convert_date_columns(pd.DataFrame(padded, columns=headers), column_types)
 
 
 def _deduplicate_headers(headers: list[str]) -> list[str]:
@@ -79,19 +135,41 @@ def _deduplicate_headers(headers: list[str]) -> list[str]:
     return result
 
 
+def _date_compare(df: pd.DataFrame, col: str, bound: str, op: str) -> pd.DataFrame:
+    """Compares an ISO-8601 date column against an ISO literal.
+
+    Date columns arrive from _convert_date_columns as ISO strings, whose
+    lexicographic order is chronological order. Rows that are not ISO-shaped
+    (blanks, stray text) never match a date comparison.
+    """
+    series = df[col].astype(str).str.strip()
+    is_date = series.str.match(_ISO_DATE_RE.pattern, na=False)
+    if op == ">":
+        return df[is_date & (series > bound)]
+    if op == ">=":
+        return df[is_date & (series >= bound)]
+    if op == "<":
+        return df[is_date & (series < bound)]
+    return df[is_date & (series <= bound)]
+
+
 def _numeric_compare(df: pd.DataFrame, col: str, raw: str, op: str) -> pd.DataFrame:
-    """Applies a numeric comparison, raising rather than silently skipping.
+    """Applies a numeric or ISO-date comparison, raising rather than silently skipping.
 
     A malformed bound such as `">abc"` previously fell into `except: pass`, so the
     condition was dropped and the caller received the *unfiltered* sheet while
     believing it was filtered — a silently wrong answer, which is worse than an error.
     """
+    raw_str = str(raw).strip()
+    if _ISO_DATE_RE.match(raw_str):
+        return _date_compare(df, col, raw_str, op)
     try:
         bound = float(raw)
     except (TypeError, ValueError):
         raise ValueError(
-            f"Condition on column '{col}' uses '{op}' but '{raw}' is not a number. "
-            f"Use a numeric bound, e.g. {{'{col}': '{op}100'}}."
+            f"Condition on column '{col}' uses '{op}' but '{raw}' is neither a "
+            f"number nor an ISO date. Use e.g. {{'{col}': '{op}100'}} or "
+            f"{{'{col}': '{op}2026-01-01'}}."
         )
     series = pd.to_numeric(df[col], errors="coerce")
     if op == ">":
@@ -220,8 +298,10 @@ def _get_file_info(folder_path: str, file_name: str) -> tuple[dict[str, Any], di
     return workspace, file_info
 
 
-def _resolve_sheet(file_info: dict[str, Any], sheet_name: str, file_name: str) -> int:
-    """Returns the header row for a sheet, failing loudly if the sheet is unknown.
+def _resolve_sheet(
+    file_info: dict[str, Any], sheet_name: str, file_name: str
+) -> dict[str, Any]:
+    """Returns the sheet's graph entry, failing loudly if the sheet is unknown.
 
     An unknown sheet used to fall through to a default header_row of 1 and then
     produce a confusing Graph 404 instead of naming the valid sheets.
@@ -232,7 +312,7 @@ def _resolve_sheet(file_info: dict[str, Any], sheet_name: str, file_name: str) -
             f"Sheet '{sheet_name}' not found in '{file_name}'. "
             f"Available sheets: {list(sheets.keys())}"
         )
-    return sheets[sheet_name].get("header_row", 1)
+    return sheets[sheet_name]
 
 
 def _clamp_limit(limit: Optional[int]) -> int:
@@ -283,8 +363,13 @@ async def execute_query(question: str, folder_path: str) -> dict:
                 "error": "File is in the search index but missing from the "
                          "structure graph. Run scan_workspace.",
             }
-        header_row = file_info.get("sheets", {}).get(sheet_name, {}).get("header_row", 1)
-        df = await _fetch_sheet_data(item_id, sheet_name, header_row)
+        sheet_info = file_info.get("sheets", {}).get(sheet_name, {})
+        df = await _fetch_sheet_data(
+            item_id,
+            sheet_name,
+            sheet_info.get("header_row", 1),
+            sheet_info.get("column_types"),
+        )
         return {
             "file": file_name,
             "sheet": sheet_name,
@@ -344,6 +429,7 @@ async def execute_inspect_file(file_name: str, folder_path: str) -> dict:
                 "header_row": s.get("header_row", 1),
                 "columns": s.get("columns", []),
                 "approx_row_count": s.get("approx_row_count"),
+                "column_types": s.get("column_types", {}),
             }
             for name, s in file_info.get("sheets", {}).items()
         },
@@ -362,8 +448,13 @@ async def execute_filter_sheet(
     folder_path = folder_path.rstrip("/")
     effective_limit = _clamp_limit(limit)
     _, file_info = _get_file_info(folder_path, file_name)
-    header_row = _resolve_sheet(file_info, sheet_name, file_name)
-    full_df = await _fetch_sheet_data(file_info["item_id"], sheet_name, header_row)
+    sheet_info = _resolve_sheet(file_info, sheet_name, file_name)
+    full_df = await _fetch_sheet_data(
+        file_info["item_id"],
+        sheet_name,
+        sheet_info.get("header_row", 1),
+        sheet_info.get("column_types"),
+    )
 
     df = full_df
     if conditions:
@@ -404,8 +495,13 @@ async def execute_aggregate(
 ) -> dict:
     folder_path = folder_path.rstrip("/")
     _, file_info = _get_file_info(folder_path, file_name)
-    header_row = _resolve_sheet(file_info, sheet_name, file_name)
-    full_df = await _fetch_sheet_data(file_info["item_id"], sheet_name, header_row)
+    sheet_info = _resolve_sheet(file_info, sheet_name, file_name)
+    full_df = await _fetch_sheet_data(
+        file_info["item_id"],
+        sheet_name,
+        sheet_info.get("header_row", 1),
+        sheet_info.get("column_types"),
+    )
 
     df = full_df
     if conditions:
@@ -493,8 +589,13 @@ async def execute_cross_file_aggregate(
 
     async def fetch_file(file_name: str, file_info: dict):
         try:
-            header_row = file_info["sheets"][sheet_name].get("header_row", 1)
-            df = await _fetch_sheet_data(file_info["item_id"], sheet_name, header_row)
+            sheet_info = file_info["sheets"][sheet_name]
+            df = await _fetch_sheet_data(
+                file_info["item_id"],
+                sheet_name,
+                sheet_info.get("header_row", 1),
+                sheet_info.get("column_types"),
+            )
             if conditions:
                 df = _apply_conditions(df, conditions)
             return file_name, df, None

@@ -166,7 +166,7 @@ class TestConditions:
         assert sorted(out["Qty"]) == ["10", "20"]
 
     def test_bad_numeric_bound_raises_instead_of_silently_passing(self):
-        with pytest.raises(ValueError, match="not a number"):
+        with pytest.raises(ValueError, match="neither a number nor an ISO date"):
             query_engine._apply_conditions(_frame(), {"Qty": ">abc"})
 
     def test_unknown_column_raises(self):
@@ -314,7 +314,7 @@ class TestCrossFileFold:
             query_engine, "load_graph", lambda: _fold_workspace(n_files)
         )
 
-        async def fake_fetch(item_id, sheet_name, header_row=1, **kwargs):
+        async def fake_fetch(item_id, sheet_name, header_row=1, column_types=None):
             frame = frames_by_item[item_id]
             if isinstance(frame, Exception):
                 raise frame
@@ -435,7 +435,7 @@ class TestCrossFileCompleteness:
     def patched(self, monkeypatch):
         monkeypatch.setattr(query_engine, "load_graph", _variant_workspace)
 
-        async def fake_fetch(item_id, sheet_name, header_row=1, **kwargs):
+        async def fake_fetch(item_id, sheet_name, header_row=1, column_types=None):
             return pd.DataFrame({"Client": ["A", "B"], "Amount": [100, 100]})
 
         monkeypatch.setattr(query_engine, "_fetch_sheet_data", fake_fetch)
@@ -575,6 +575,101 @@ class TestHeaderDetection:
         idx, cols, found = structure.detect_header_row(data)
         assert idx == 0
         assert not found
+
+
+# ------------------------------------------------------------ serial dates
+
+
+class TestDateFormatDetection:
+    @pytest.mark.parametrize(
+        "fmt",
+        ["m/d/yyyy", "dd-mmm-yy", "yyyy-mm-dd", "d-mmm", "hh:mm:ss", "[$-409]d-mmm;@"],
+    )
+    def test_date_formats_detected(self, fmt):
+        assert structure.is_date_number_format(fmt)
+
+    @pytest.mark.parametrize(
+        "fmt", ["General", "0.00", "#,##0.00", "$#,##0.00", "@", "0%", None, ""]
+    )
+    def test_non_date_formats_rejected(self, fmt):
+        assert not structure.is_date_number_format(fmt)
+
+    def test_quoted_literals_do_not_confuse_detection(self):
+        # 'd' inside a quoted literal is text, not a day token.
+        assert not structure.is_date_number_format('"days" 0')
+
+    def test_detect_date_columns_uses_first_data_cell(self):
+        values = [["Name", "When", "Qty"], ["a", 45000, 5], ["b", 45001, 6]]
+        formats = [["General"] * 3, ["General", "m/d/yyyy", "0"], ["General", "m/d/yyyy", "0"]]
+        types = structure.detect_date_columns(values, formats, 0, ["Name", "When", "Qty"])
+        assert types == {"When": "date"}
+
+    def test_blank_leading_cells_are_skipped(self):
+        values = [["Name", "When"], ["a", None], ["b", 45000]]
+        formats = [["General"] * 2, ["General", "General"], ["General", "yyyy-mm-dd"]]
+        types = structure.detect_date_columns(values, formats, 0, ["Name", "When"])
+        assert types == {"When": "date"}
+
+
+class TestSerialConversion:
+    def test_whole_serial_becomes_date(self):
+        assert query_engine._serial_to_iso(45000) == "2023-03-15"
+
+    def test_fractional_serial_keeps_time(self):
+        assert query_engine._serial_to_iso(45000.5) == "2023-03-15T12:00:00"
+
+    def test_epoch_offset_is_lotus_compatible(self):
+        # Serial 1 is 1900-01-01 in the 1900 date system.
+        assert query_engine._serial_to_iso(1) == "1899-12-31"
+        assert query_engine._serial_to_iso(2) == "1900-01-01"
+
+    def test_non_numeric_passes_through(self):
+        assert query_engine._serial_to_iso("already a string") == "already a string"
+        assert query_engine._serial_to_iso(None) is None
+
+    def test_absurd_serial_is_left_alone(self):
+        assert query_engine._serial_to_iso(1e12) == 1e12
+
+    def test_convert_only_flagged_columns(self):
+        df = pd.DataFrame({"When": [45000, "x"], "Qty": [45000, 1]})
+        out = query_engine._convert_date_columns(df, {"When": "date"})
+        assert out["When"].tolist() == ["2023-03-15", "x"]
+        assert out["Qty"].tolist() == [45000, 1]  # untouched
+
+
+class TestDateConditions:
+    def _dates(self):
+        return pd.DataFrame(
+            {
+                "Batch Date": ["2026-01-15", "2026-03-01", "2025-12-31", "", "n/a"],
+                "Qty": [1, 2, 3, 4, 5],
+            }
+        )
+
+    def test_iso_range_conditions(self):
+        out = query_engine._apply_conditions(
+            self._dates(), {"Batch Date": ">=2026-01-01"}
+        )
+        assert out["Qty"].tolist() == [1, 2]
+        out = query_engine._apply_conditions(
+            self._dates(), {"Batch Date": "<2026-01-01"}
+        )
+        assert out["Qty"].tolist() == [3]
+
+    def test_non_date_rows_never_match_date_comparisons(self):
+        out = query_engine._apply_conditions(
+            self._dates(), {"Batch Date": ">=1000-01-01"}
+        )
+        assert out["Qty"].tolist() == [1, 2, 3]  # blanks and 'n/a' excluded
+
+    def test_datetime_rows_compare_correctly_against_date_bounds(self):
+        df = pd.DataFrame({"When": ["2026-01-01T09:30:00"], "Qty": [1]})
+        assert len(query_engine._apply_conditions(df, {"When": ">=2026-01-01"})) == 1
+        assert len(query_engine._apply_conditions(df, {"When": "<2026-01-02"})) == 1
+
+    def test_garbage_bound_still_raises(self):
+        with pytest.raises(ValueError, match="neither a number nor an ISO date"):
+            query_engine._apply_conditions(self._dates(), {"Batch Date": ">soon"})
 
 
 # ------------------------------------------------------------- A1 notation
