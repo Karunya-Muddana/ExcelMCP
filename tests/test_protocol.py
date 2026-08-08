@@ -89,7 +89,10 @@ def test_stdout_is_pure_jsonrpc(tmp_path):
     # All three requests must have been answered — a desynced or crashed
     # server that emitted only valid JSON would still fail here.
     answered = {m.get("id") for m in parsed if isinstance(m, dict)}
-    assert {1, 2, 3} <= answered
+    assert {1, 2, 3} <= answered, (
+        f"unanswered requests; got ids {answered}. "
+        f"Server stderr:\n{stderr.decode('utf-8', 'replace')}"
+    )
 
     # The diagnostic the query path emits with an empty index must have gone
     # to stderr, proving the path that used to pollute stdout was exercised.
