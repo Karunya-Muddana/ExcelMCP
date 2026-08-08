@@ -63,7 +63,9 @@ class TestStructureInvariant:
                 assert "rows" not in sheet, f"row data cached in {file_name}/{sheet_name}"
                 assert set(sheet) <= {
                     "header_row",
+                    "header_source",
                     "columns",
+                    "columns_raw",
                     "description",
                     "approx_row_count",
                     "used_range_address",
@@ -71,7 +73,22 @@ class TestStructureInvariant:
                     "column_count",
                     "column_types",
                     "sampled_values",
+                    # v0.3 region map. Row spans and cell addresses derived
+                    # from formulas — geometry, never contents.
+                    "regions",
+                    "unclaimed_rows",
+                    "layout_confidence",
+                    "sheet_references",
                 }
+                for region in sheet.get("regions", []):
+                    assert set(region) <= {
+                        "type",
+                        "range",
+                        "body",
+                        "header_row",
+                        "source",
+                        "confidence",
+                    }
                 for col, values in sheet.get("sampled_values", {}).items():
                     assert len(values) <= 50, f"oversampled {file_name}/{sheet_name}/{col}"
 

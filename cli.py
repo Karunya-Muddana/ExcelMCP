@@ -388,6 +388,25 @@ async def do_scan(folder: str) -> bool:
     sheets = sum(len(f["sheets"]) for f in files.values())
     ok(f"Indexed [bold]{len(files)}[/] workbook(s), [bold]{sheets}[/] sheet(s).")
 
+    # A sheet holding several table bodies is one where a plain total adds up
+    # blocks that were never meant to be summed. Say so at scan time, while the
+    # user is looking, rather than leaving it for an agent to trip over.
+    multi_region = [
+        (file_name, sheet_name, len(sheet_info.get("regions", [])))
+        for file_name, file_info in files.items()
+        for sheet_name, sheet_info in file_info.get("sheets", {}).items()
+        if len(sheet_info.get("regions", [])) > 1
+    ]
+    if multi_region:
+        info(
+            f"{len(multi_region)} sheet(s) hold more than one table. "
+            f"Totalling one of these whole will sum unrelated blocks together:"
+        )
+        for file_name, sheet_name, count in multi_region[:10]:
+            info(f"  {file_name} / {sheet_name} — {count} table regions")
+        if len(multi_region) > 10:
+            info(f"  ...and {len(multi_region) - 10} more.")
+
     try:
         with console.status("[cyan]Building semantic index...", spinner="dots"):
             update_embeddings(folder, files)

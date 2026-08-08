@@ -54,7 +54,7 @@ cd ExcelMCP
 
 uv sync      # install dependencies
 uv build     # build the wheel
-pip install dist/excelmcp-0.2.0-py3-none-any.whl
+pip install dist/excelmcp-0.3.0-py3-none-any.whl
 ```
 
 Or install straight from source without building:
@@ -118,7 +118,7 @@ excelmcp-setup --dry-run             # print the changes, write nothing
 
 | Tool | Network | What it does |
 |---|---|---|
-| `get_workspace_graph` | none | Full structure of the workspace: files, sheets, columns, relationships, naming variants, scan age. Instant. |
+| `get_workspace_graph` | none | Full structure of the workspace: files, sheets, columns, table regions, relationships, naming variants, scan age. Instant. |
 | `inspect_file` | none | Same, narrowed to one file, with approximate row counts as of the last scan. Instant. |
 | `scan_workspace` | heavy | Re-crawls OneDrive and rebuilds structure, sampled values, relationships, embeddings. |
 | `query` | live | Natural language question, routed by vector similarity plus lexical rerank. |
@@ -265,14 +265,15 @@ The built in client ID is a public client used for device-code flow. It carries 
 ~/.excelmcp/
   token.json           MSAL token cache. Auth material only, written 0600.
   graph.json           Structure graph: item IDs, sheet names, column headers,
-                       used-range dimensions, date column types, inferred
+                       used-range dimensions, date column types, per-sheet
+                       table regions, inferred and formula-declared
                        relationships — and sampled values (see below).
   vectors.npy          Embedded sheet descriptions for semantic routing.
   metadata.json        Labels and lexical terms tying each embedding to a sheet.
   relationships.yaml   Optional, written by you: declared join relationships.
 ```
 
-**The honest version of the no-cache claim, as of 0.2.0.** No row of your
+**The honest version of the no-cache claim, as of 0.3.0.** No row of your
 data, no cell grid, and no queryable value is stored on disk — every answer
 is served from a live fetch, always. There is one deliberate exception:
 `graph.json` stores **sampled values**, up to 50 distinct text labels per
@@ -284,7 +285,11 @@ relationships can be inferred from value overlap rather than assumed from
 column names. They are routing evidence, not a data cache: nothing ever
 answers a question from them, and a workspace scan refreshes them wholesale.
 The graph also stores a per-sheet structure fingerprint (header columns and
-used-range address) purely to detect drift. If any of this is more than you
+used-range address) purely to detect drift, and — new in 0.3.0 — a **region
+map**: the row spans of each table body on a sheet, derived from the ranges the
+sheet's own `SUM`/`COUNT`/`AVERAGE` formulas refer to, plus the addresses any
+cross-sheet formula reads. Those are row numbers and cell addresses, not
+contents; no value is read to produce them. If any of this is more than you
 want on disk, don't scan that folder; if you want to verify the boundary,
 `graph.json` is small and readable, so go look.
 

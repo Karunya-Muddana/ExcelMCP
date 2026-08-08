@@ -26,7 +26,12 @@ from excelmcp.graph_client import get_named_range, get_range
 from excelmcp.query_engine import _serial_to_iso
 from excelmcp.ranges import build_cell, build_range, parse_range
 from excelmcp.storage import log
-from excelmcp.structure import is_date_number_format, load_graph, normalise_name
+from excelmcp.structure import (
+    is_date_number_format,
+    load_graph,
+    normalise_name,
+    require_current_schema,
+)
 
 _WORD_RE = re.compile(r"[a-z0-9]+")
 
@@ -85,6 +90,7 @@ def _workspace_files(folder_path: str) -> dict[str, Any]:
         raise ValueError(
             f"Workspace '{folder_path}' not found. Run scan_workspace first."
         )
+    require_current_schema(workspace, folder_path)
     return workspace.get("files", {})
 
 

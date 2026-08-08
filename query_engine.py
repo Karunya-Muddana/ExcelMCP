@@ -14,6 +14,7 @@ from excelmcp.structure import (
     fuzzy_name_candidates,
     load_graph,
     normalise_name,
+    require_current_schema,
     workspace_relationships,
 )
 
@@ -382,6 +383,7 @@ def _get_file_info(folder_path: str, file_name: str) -> tuple[dict[str, Any], di
         raise ValueError(
             f"Workspace '{folder_path}' not found. Run scan_workspace first."
         )
+    require_current_schema(workspace, folder_path)
     file_info = workspace.get("files", {}).get(file_name)
     if not file_info:
         available = list(workspace.get("files", {}).keys())
@@ -556,9 +558,16 @@ async def execute_inspect_file(file_name: str, folder_path: str) -> dict:
         "sheets": {
             name: {
                 "header_row": s.get("header_row", 1),
+                "header_source": s.get("header_source", "heuristic"),
                 "columns": s.get("columns", []),
                 "approx_row_count": s.get("approx_row_count"),
                 "column_types": s.get("column_types", {}),
+                # Absolute sheet rows, unlike header_row. A sheet with more
+                # than one table region is one where an unqualified aggregate
+                # spans blocks that were never meant to be added together.
+                "regions": s.get("regions", []),
+                "unclaimed_rows": s.get("unclaimed_rows", []),
+                "layout_confidence": s.get("layout_confidence", "unconfirmed"),
             }
             for name, s in file_info.get("sheets", {}).items()
         },
@@ -903,6 +912,11 @@ def _suggest_join_keys(
     """Resolves join keys from known relationships, refusing rather than guessing."""
     candidates = []
     for rel in workspace_relationships(workspace):
+        # Formula-derived reference edges say "this cell reads that cell", not
+        # "these columns hold the same entities". They carry confidence 1.0 and
+        # would otherwise win the join outright, on a key that means nothing.
+        if rel.get("kind") == "reference":
+            continue
         ends = (rel.get("left", {}), rel.get("right", {}))
         for a, b in (ends, ends[::-1]):
             if (

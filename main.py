@@ -180,6 +180,15 @@ Also returns sheet_name_variants: groups of sheet names
 that differ only in case or whitespace across files —
 check it before any cross-file operation, because those
 match by exact sheet name.
+Each sheet carries a `regions` list: the table bodies found
+in it, derived from the sheet's own SUM/COUNT formulas, in
+absolute sheet rows. A sheet with more than one region holds
+several separate tables (also listed in multi_region_sheets),
+so a plain aggregate over it adds up blocks that were never
+meant to be summed — read its unclaimed_rows and check which
+region you mean before totalling anything.
+layout_confidence is "unconfirmed" wherever the region map
+came from formulas alone and nothing has verified it.
 Use this before any filter_sheet call when unsure which
 file or column to query.
 """
@@ -206,6 +215,19 @@ async def get_workspace_graph(folder_path: Optional[str] = None) -> dict:
     data["sheet_name_variants"] = sheet_name_variants(workspace.get("files", {}))
     # Declared relationships (relationships.yaml) merged ahead of inferred.
     data["relationships"] = workspace_relationships(workspace)
+    # Sheets holding more than one table region: an unqualified aggregate over
+    # one of these sums blocks that were never meant to be added together.
+    data["multi_region_sheets"] = [
+        {
+            "file": file_name,
+            "sheet": sheet_name,
+            "regions": len(sheet_info.get("regions", [])),
+            "layout_confidence": sheet_info.get("layout_confidence", "unconfirmed"),
+        }
+        for file_name, file_info in workspace.get("files", {}).items()
+        for sheet_name, sheet_info in file_info.get("sheets", {}).items()
+        if len(sheet_info.get("regions", [])) > 1
+    ]
     scan_age = _scan_age(workspace.get("files", {}))
     if scan_age:
         data["scan_age"] = scan_age

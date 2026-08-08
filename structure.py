@@ -15,7 +15,16 @@ from excelmcp.graph_client import (
     list_excel_files,
 )
 from excelmcp.ranges import build_range, parse_range
+from excelmcp.regions import derive_sheet_regions, extract_sheet_references
 from excelmcp.storage import atomic_write_text, get_config_dir, log, read_json
+
+
+# Bumped whenever a scan starts recording something readers depend on. v3 adds
+# per-sheet `regions`: without them every sheet is treated as one table, which
+# is how a multi-section sheet silently returns a six-fold overcount. A graph
+# written by an older version is not upgradable in place — the regions come
+# from formulas nobody fetched — so readers refuse it and name the fix.
+GRAPH_SCHEMA_VERSION = 3
 
 
 def get_graph_path() -> Path:
@@ -34,17 +43,47 @@ def load_graph() -> dict[str, Any]:
     return graph
 
 
+def require_current_schema(workspace: dict[str, Any], folder_path: str) -> None:
+    """Raises when a workspace was scanned by a version that knew less than this one.
+
+    Following the precedent set for v0.2's range-address fields: an out-of-date
+    graph fails loudly with the one command that fixes it, rather than quietly
+    answering from a model of the workbook that no longer holds.
+    """
+    version = workspace.get("schema_version", 0)
+    if not isinstance(version, int) or version < GRAPH_SCHEMA_VERSION:
+        raise ValueError(
+            f"The structure graph for '{folder_path}' predates v0.3 "
+            f"(schema {version}, expected {GRAPH_SCHEMA_VERSION}) and has no "
+            f"region map, so multi-section sheets would be read as one table. "
+            f"Run scan_workspace on '{folder_path}' once to rebuild it."
+        )
+
+
 def save_graph(graph: dict[str, Any]) -> None:
     atomic_write_text(get_graph_path(), json.dumps(graph, indent=2))
 
 
-def normalise_name(name: Any) -> str:
-    """Case- and whitespace-insensitive form of a sheet or column name.
+# Chemical and unit names arrive both ways in one workbook: the sheet is called
+# 'H2SO4 & Soda Ash' while a cell inside it says 'Sulphuric Acid (H₂SO₄)'. Folded
+# to their ASCII digits, a query saying H2SO4 reaches both.
+_DIGIT_FOLD = str.maketrans(
+    {
+        **{chr(0x2080 + d): str(d) for d in range(10)},  # ₀..₉
+        "⁰": "0", "¹": "1", "²": "2", "³": "3", "⁴": "4",
+        "⁵": "5", "⁶": "6", "⁷": "7", "⁸": "8", "⁹": "9",
+    }
+)
 
-    'Sales ', 'sales' and 'SALES' all normalise to 'sales'. Used to detect the
-    near-miss naming that makes cross-file operations silently partial.
+
+def normalise_name(name: Any) -> str:
+    """Case-, whitespace- and subscript-insensitive form of a sheet or column name.
+
+    'Sales ', 'sales' and 'SALES' all normalise to 'sales'; 'H₂SO₄' and 'H2SO4'
+    both become 'h2so4'. Used to detect the near-miss naming that makes
+    cross-file operations silently partial.
     """
-    return " ".join(str(name).split()).casefold()
+    return " ".join(str(name).translate(_DIGIT_FOLD).split()).casefold()
 
 
 def fuzzy_name_candidates(
@@ -105,9 +144,29 @@ def _deduplicate_columns(columns: list[str]) -> list[str]:
 
 
 def columns_from_row(row: list[Any]) -> list[str]:
-    """Turns one raw sheet row into cleaned, deduplicated column names."""
+    """Turns one raw sheet row into cleaned, deduplicated column names.
+
+    Internal whitespace is collapsed, not just trimmed: a header cell wrapped
+    across two lines in Excel arrives as 'Qty\\n(Kgs)', and a column an agent
+    cannot type is a column it cannot query. The exact spelling stays available
+    via :func:`raw_columns_from_row`.
+    """
     columns = [
-        str(c).strip() if c is not None and str(c).strip() else f"Column_{i}"
+        " ".join(str(c).split()) if c is not None and str(c).strip() else f"Column_{i}"
+        for i, c in enumerate(row)
+    ]
+    return _deduplicate_columns(columns)
+
+
+def raw_columns_from_row(row: list[Any]) -> list[str]:
+    """Header names exactly as the sheet spells them, positionally aligned with
+    :func:`columns_from_row` and deduplicated the same way.
+
+    Kept so that writing back to a cell, or matching a name a user copied out of
+    Excel, can use the real string rather than the display-friendly one.
+    """
+    columns = [
+        str(c) if c is not None and str(c).strip() else f"Column_{i}"
         for i, c in enumerate(row)
     ]
     return _deduplicate_columns(columns)
@@ -183,6 +242,7 @@ def infer_relationships(files: dict[str, Any]) -> list[dict[str, Any]]:
                 {
                     "left": {"file": a[0], "sheet": a[1], "column": a[2]},
                     "right": {"file": b[0], "sheet": b[1], "column": b[2]},
+                    "kind": "join_key",
                     "confidence": round(overlap, 3),
                     "source": "inferred",
                     "evidence": {
@@ -195,6 +255,87 @@ def infer_relationships(files: dict[str, Any]) -> list[dict[str, Any]]:
             )
     relationships.sort(key=lambda r: -r["confidence"])
     return relationships[:_MAX_RELATIONSHIPS]
+
+
+def _columns_at(sheet_info: dict[str, Any], address: str) -> list[str]:
+    """Column names a formula's target address lands on, best-effort.
+
+    Empty when the target sheet has no cached range address, or the address
+    falls outside the columns recorded for it.
+    """
+    target_address = sheet_info.get("used_range_address")
+    columns = sheet_info.get("columns") or []
+    if not target_address or not columns:
+        return []
+    try:
+        base_col = parse_range(target_address)[0]
+        col1, _, col2, _ = parse_range(address)
+    except ValueError:
+        return []
+    names = []
+    for col in range(col1, col2 + 1):
+        idx = col - base_col
+        if 0 <= idx < len(columns):
+            names.append(columns[idx])
+    return names
+
+
+def formula_relationships(files: dict[str, Any]) -> list[dict[str, Any]]:
+    """Cross-sheet dependencies the workbook states outright in its formulas.
+
+    ``='CMC Statement'!C48`` on the Dashboard is not an inference — it is the
+    author wiring two sheets together, and it carries confidence 1.0 for that
+    reason. It is *not* a join key, though: it says "this cell reads that cell",
+    not "these two columns hold the same entities". Both live in the same
+    ``relationships`` list so an agent can see the whole dependency picture, and
+    they are told apart by ``kind`` — ``"reference"`` here against the implicit
+    ``"join_key"`` of :func:`infer_relationships`. Anything choosing join keys
+    must filter on it; joining on a reference edge would be nonsense.
+    """
+    found: list[dict[str, Any]] = []
+    for file_name, file_info in files.items():
+        sheets = file_info.get("sheets", {})
+        by_normalised = {normalise_name(name): name for name in sheets}
+        for sheet_name, sheet_info in sheets.items():
+            for reference in sheet_info.get("sheet_references", []) or []:
+                raw_target = reference.get("sheet", "")
+                target = (
+                    raw_target
+                    if raw_target in sheets
+                    else by_normalised.get(normalise_name(raw_target), "")
+                )
+                if not target or target == sheet_name:
+                    continue
+                addresses = reference.get("addresses", [])
+                columns: list[str] = []
+                for address in addresses:
+                    for name in _columns_at(sheets[target], address):
+                        if name not in columns:
+                            columns.append(name)
+                found.append(
+                    {
+                        "left": {
+                            "file": file_name,
+                            "sheet": sheet_name,
+                            "column": None,
+                        },
+                        "right": {
+                            "file": file_name,
+                            "sheet": target,
+                            "column": columns[0] if len(columns) == 1 else None,
+                        },
+                        "kind": "reference",
+                        "confidence": 1.0,
+                        "source": "formula",
+                        "evidence": {
+                            "addresses": addresses[:10],
+                            "reference_count": len(addresses),
+                            "target_columns": columns[:10],
+                        },
+                    }
+                )
+    found.sort(key=lambda r: (r["left"]["file"], r["left"]["sheet"], r["right"]["sheet"]))
+    return found[:_MAX_RELATIONSHIPS]
 
 
 def get_relationships_yaml_path() -> Path:
@@ -398,6 +539,24 @@ async def _scan_sheet_structure(
         return None
 
     col1, row1, col2, row2 = parse_range(address)
+
+    # Formulas for the whole sheet, not just the window. They compress far
+    # better than values — a column of them is the same expression repeated per
+    # row — and they are the only free evidence of where each table body ends.
+    formulas: list[list[Any]] = []
+    try:
+        formula_data = await get_used_range(
+            item_id, sheet_name, session_id, select="formulas"
+        )
+        formulas = formula_data.get("formulas") or []
+    except Exception as exc:
+        # A sheet whose formulas cannot be read still has a usable header; it
+        # just falls back to the single-region heuristic.
+        log(f"[Scan] No formulas for '{sheet_name}' ({exc}) — regions unavailable.")
+
+    regions, unclaimed = derive_sheet_regions(formulas, row1, row2)
+    references = extract_sheet_references(formulas)
+
     window_address = build_range(
         col1,
         row1,
@@ -412,15 +571,54 @@ async def _scan_sheet_structure(
         select="values,numberFormat",
     )
     header_idx, columns, found = detect_header_row(window)
+    header_source = "heuristic"
+    block = window
+    block_row1 = row1
+
+    # The first table body a formula names outranks the heuristic. The heuristic
+    # takes the first row that *looks* like a header, which on a sheet opening
+    # with a client banner or a summary block is the banner — and every row
+    # after it is then served as data. body_start - 1 is the row the workbook's
+    # own totals imply, and it is right far more often.
+    primary_header = regions[0]["header_row"] if regions else None
+    if primary_header is not None:
+        if not (row1 <= primary_header <= min(row2, row1 + _HEADER_WINDOW_ROWS - 1)):
+            # The formula-derived header sits outside the detection window, so
+            # read a small block starting at it — values for the names,
+            # numberFormat for date detection.
+            block_row1 = primary_header
+            block = await get_range(
+                item_id,
+                sheet_name,
+                build_range(
+                    col1,
+                    primary_header,
+                    min(col2, col1 + _SCAN_WINDOW_COLS - 1),
+                    min(row2, primary_header + _HEADER_WINDOW_ROWS - 1),
+                ),
+                session_id,
+                select="values,numberFormat",
+            )
+        candidate_idx = primary_header - block_row1
+        block_values = block.get("values") or []
+        if 0 <= candidate_idx < len(block_values):
+            header_idx = candidate_idx
+            columns = columns_from_row(block_values[candidate_idx])
+            found = True
+            header_source = "formula"
+        else:
+            # The read came back short of the row the formulas pointed at.
+            # Keep the heuristic's answer rather than indexing into nothing.
+            block, block_row1 = window, row1
 
     column_types: dict[str, str] = {}
     if found:
-        # numberFormat is only fetched for the window; if the header lives
+        # numberFormat is only fetched for the block; if the header lives
         # beyond it (rare), date detection is skipped rather than paying for
         # formats on a full-sheet read.
         column_types = detect_date_columns(
-            window.get("values", []),
-            window.get("numberFormat", []),
+            block.get("values", []),
+            block.get("numberFormat", []),
             header_idx,
             columns,
         )
@@ -432,28 +630,41 @@ async def _scan_sheet_structure(
     if not columns:
         return None
 
+    header_abs = block_row1 + header_idx  # absolute 1-based sheet row
+    raw_columns = list(columns)
+
     if column_count > _SCAN_WINDOW_COLS:
         # The detection window is capped at 52 columns; re-read the header row
         # at full width so wide sheets don't lose column names.
-        header_row_address = build_range(
-            col1, row1 + header_idx, col2, row1 + header_idx
-        )
+        header_row_address = build_range(col1, header_abs, col2, header_abs)
         header_data = await get_range(
             item_id, sheet_name, header_row_address, session_id
         )
         header_values = (header_data.get("values") or [[]])[0]
         if header_values:
             columns = columns_from_row(header_values)
+            raw_columns = raw_columns_from_row(header_values)
+    else:
+        block_values = block.get("values") or []
+        if 0 <= header_idx < len(block_values):
+            raw_columns = raw_columns_from_row(block_values[header_idx])
 
     sampled_values: dict[str, list[str]] = {}
     if found:
-        sample_start = row1 + header_idx + 1
-        if sample_start <= row2:
+        # Sampling is confined to the first table body when one is known, so
+        # section titles and totals rows below it never become "values this
+        # column contains" in the routing description.
+        sample_start = header_abs + 1
+        sample_end = min(row2, sample_start + _SAMPLE_ROWS - 1)
+        if regions:
+            body_end = int(regions[0]["body"].split(":")[1])
+            sample_end = min(sample_end, body_end)
+        if sample_start <= sample_end:
             sample_address = build_range(
                 col1,
                 sample_start,
                 min(col2, col1 + _SCAN_WINDOW_COLS - 1),
-                min(row2, sample_start + _SAMPLE_ROWS - 1),
+                sample_end,
             )
             sample = await get_range(
                 item_id, sheet_name, sample_address, session_id, select="values"
@@ -463,15 +674,29 @@ async def _scan_sheet_structure(
             )
 
     entry: dict[str, Any] = {
-        "header_row": header_idx + 1,
+        # 1-based offset into the used range, not an absolute sheet row — the
+        # convention every reader (query_engine, lookup) already relies on.
+        # `regions` uses absolute sheet rows; the two differ by row1 - 1.
+        "header_row": header_abs - row1 + 1,
+        "header_source": header_source,
         "columns": columns,
         "used_range_address": address,
         "row_count": row_count,
         "column_count": column_count,
         # A count, not cell values — recorded so inspect_file can report
         # size without a live call. Labelled as_of_last_scan where surfaced.
-        "approx_row_count": max(0, row_count - header_idx - 1),
+        "approx_row_count": max(0, row2 - header_abs),
+        "regions": regions,
+        "unclaimed_rows": unclaimed,
+        # Tier 1 guesses every header from a formula's body start; nothing has
+        # confirmed it and nothing knows what the regions *mean*. An agent
+        # should be able to see that a sheet has not been interpreted yet.
+        "layout_confidence": "unconfirmed",
     }
+    if raw_columns != columns:
+        entry["columns_raw"] = raw_columns
+    if references:
+        entry["sheet_references"] = references
     if column_types:
         entry["column_types"] = column_types
     if sampled_values:
@@ -556,10 +781,14 @@ async def discover_structure(folder_path: str) -> dict[str, Any]:
         discovered[file_name] = entry
 
     workspace = {
+        "schema_version": GRAPH_SCHEMA_VERSION,
         "files": discovered,
         # Recomputed from scratch each scan; user-declared relationships live
         # in relationships.yaml and are merged in at read time, not persisted.
-        "relationships": infer_relationships(discovered),
+        # Formula-declared references come first: they are facts, not guesses.
+        "relationships": (
+            formula_relationships(discovered) + infer_relationships(discovered)
+        ),
     }
     graph["workspaces"][folder_path] = workspace
 

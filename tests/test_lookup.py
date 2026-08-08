@@ -17,6 +17,7 @@ import json
 import pytest
 
 from excelmcp import lookup, ranges
+from excelmcp.structure import GRAPH_SCHEMA_VERSION as SCHEMA
 
 N_ROWS = 1000  # data rows per Rate Card
 N_COLS = 30
@@ -144,7 +145,7 @@ def fake(monkeypatch):
             }
         files[_file_name(idx)] = {"item_id": item_id, "sheets": sheets}
 
-    graph = {"workspaces": {"/Contracts": {"files": files}}}
+    graph = {"workspaces": {"/Contracts": {"schema_version": SCHEMA, "files": files}}}
     monkeypatch.setattr(lookup, "load_graph", lambda: graph)
     monkeypatch.setattr(lookup, "get_range", fake.get_range)
     monkeypatch.setattr(lookup, "search", lambda *a, **k: [])

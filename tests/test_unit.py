@@ -14,6 +14,7 @@ import pandas as pd
 import pytest
 
 from excelmcp import auth, embeddings, graph_client, query_engine, storage, structure
+from excelmcp.structure import GRAPH_SCHEMA_VERSION as SCHEMA
 from excelmcp.graph_client import (
     _parse_retry_after,
     quote_drive_path,
@@ -303,7 +304,7 @@ def _fold_workspace(n_files):
         }
         for i in range(n_files)
     }
-    return {"workspaces": {"/ERP": {"files": files}}}
+    return {"workspaces": {"/ERP": {"schema_version": SCHEMA, "files": files}}}
 
 
 class TestCrossFileFold:
@@ -427,7 +428,7 @@ def _variant_workspace():
             "item_id": f"id{i}",
             "sheets": {"Sales 2024": {"header_row": 1, "columns": ["Client", "Amount"]}},
         }
-    return {"workspaces": {"/ERP": {"files": files}}}
+    return {"workspaces": {"/ERP": {"schema_version": SCHEMA, "files": files}}}
 
 
 class TestCrossFileCompleteness:
@@ -690,6 +691,7 @@ def _join_graph(relationships=None):
     return {
         "workspaces": {
             "/ERP": {
+                "schema_version": SCHEMA,
                 "files": {
                     "stock.xlsx": {
                         "item_id": "stock",
@@ -799,6 +801,7 @@ class TestDerive:
         graph = {
             "workspaces": {
                 "/ERP": {
+                    "schema_version": SCHEMA,
                     "files": {
                         "tx.xlsx": {
                             "item_id": "tx",
@@ -954,6 +957,7 @@ class TestAggregateGrammar:
         graph = {
             "workspaces": {
                 "/ERP": {
+                    "schema_version": SCHEMA,
                     "files": {
                         "s.xlsx": {
                             "item_id": "id1",
@@ -1189,10 +1193,13 @@ class TestRanges:
 
 
 class TestScanSheetStructure:
-    def _fakes(self, monkeypatch, meta, windows, full=None):
+    def _fakes(self, monkeypatch, meta, windows, full=None, formulas=None):
         calls = []
 
         async def fake_used_range(item_id, sheet, session=None, *, select=None, **kw):
+            if select and "formulas" in select:
+                calls.append(("formulas", select))
+                return {"formulas": formulas or []}
             if select and "values" not in select:
                 calls.append(("meta", select))
                 return meta
@@ -1223,8 +1230,8 @@ class TestScanSheetStructure:
         assert entry["row_count"] == 500
         assert entry["approx_row_count"] == 499
         assert entry["sampled_values"]["Status"] == ["Closed", "Open"]
-        # Metadata, header window, sampling window — never the whole sheet.
-        assert [kind for kind, _ in calls] == ["meta", "range", "range"]
+        # Metadata, formulas, header window, sampling window — never the whole sheet.
+        assert [kind for kind, _ in calls] == ["meta", "formulas", "range", "range"]
 
     def test_no_header_in_window_falls_back_to_full_read(self, monkeypatch):
         numeric = {"values": [[1, 2]] * 10}
@@ -1238,7 +1245,13 @@ class TestScanSheetStructure:
         assert entry["columns"] == ["Name", "Qty"]
         assert entry["header_row"] == 12
         # Falls back to the full read, then still samples values for routing.
-        assert [kind for kind, _ in calls] == ["meta", "range", "full", "range"]
+        assert [kind for kind, _ in calls] == [
+            "meta",
+            "formulas",
+            "range",
+            "full",
+            "range",
+        ]
 
     def test_empty_sheet_returns_none(self, monkeypatch):
         self._fakes(

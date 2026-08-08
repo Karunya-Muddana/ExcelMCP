@@ -1,5 +1,75 @@
 # Changelog
 
+## 0.3.0 — 2026-08-08
+
+### You must re-scan. Tools refuse to run until you do.
+
+`graph.json` gained a per-sheet region map that cannot be back-filled from an
+existing graph — the regions come from formulas no earlier version fetched. Any
+workspace scanned by 0.2.0 or earlier now fails with a message naming the fix.
+Run `scan_workspace` once per folder.
+
+### Why: a sheet is not a table
+
+Measured against a real eight-sheet contract workbook, the 0.2.0 header
+heuristic was right on three sheets. On the rest it took the client banner, or
+a value, as the header row — and because the graph held exactly one
+`header_row` per sheet, every section title, repeated header and totals block
+below the first region was handed to the agent as data. `aggregate(sum, 'Qty
+(Kgs)')` on one such sheet returned 277,371 against a true figure of 45,000. A
+six-fold overcount, silently.
+
+**If you ran a 0.2.0 aggregate over a sheet with more than one table on it, the
+number was probably too large. Re-check it.** `get_workspace_graph` now lists
+`multi_region_sheets`, which is exactly the set of sheets where this was
+possible.
+
+### Table regions, derived from the workbook's own formulas
+
+- A sheet's `SUM`/`SUMIF(S)`/`COUNT`/`COUNTA`/`COUNTIF(S)`/`AVERAGE` calls
+  already state where each block starts and ends: `=SUM(C7:C31)` in a totals
+  row is the author declaring the extent of the table above it. Scan now reads
+  the sheet's formulas, merges the ranges those functions refer to, and records
+  the result as `regions` — one entry per table body, in absolute sheet rows.
+  On the reference workbook this finds all eleven bodies across the eight
+  sheets.
+- The header row is taken as `body_start - 1` and outranks the old heuristic,
+  which is what moves the workbook from three sheets right to seven. The four
+  remaining misses are all exactly one row late, all caused by an
+  `Opening Balance` line between the header and the first numbered row. Nothing
+  deterministic can resolve those, so every region is marked
+  `layout_confidence: "unconfirmed"` and `unclaimed_rows` reports the spans no
+  region accounts for, rather than pretending they are data.
+- Value sampling is now confined to the first table body, so section titles and
+  totals rows below it no longer show up as "values this column contains".
+
+### Cross-sheet references are recorded as facts
+
+`='CMC Statement'!C48` is a stated dependency, not an inference. Those are
+extracted at scan and appear in `relationships` with `source: "formula"` and
+confidence 1.0. They carry `kind: "reference"` to distinguish them from the
+`kind: "join_key"` edges that name-and-value inference produces — a reference
+says "this cell reads that cell", not "these columns hold the same entities",
+so `join_sheets` explicitly ignores them rather than joining on a meaningless
+key.
+
+### Smaller fixes from the same workbook
+
+- Header cells wrapped across lines in Excel (`'Qty\n(Kgs)'`) now collapse to
+  `'Qty (Kgs)'`; a column an agent cannot type is a column it cannot query. The
+  exact spelling is kept in `columns_raw` when it differs.
+- Subscripts and superscripts fold to ASCII digits in name matching, so a query
+  saying `H2SO4` reaches `Sulphuric Acid (H₂SO₄)` and the sheet named
+  `H2SO4 & Soda Ash`.
+
+### Not in this release
+
+Region-*aware* tool arguments. `filter_sheet` and `aggregate` still read a
+sheet as a whole, so on a multi-region sheet you must still narrow with
+conditions or use `derive`. Regions are visible in the graph and in
+`inspect_file` so an agent can see the trap; making the tools take a `region`
+argument, and making `aggregate` refuse on transactional regions, comes next.
+
 ## 0.2.0 — 2026-08-08
 
 ### If you ran 0.1.0 in production, read these two first
