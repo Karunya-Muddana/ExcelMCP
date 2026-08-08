@@ -7,7 +7,7 @@ from typing import Any, Callable, Optional
 
 import msal
 
-from excelmcp.storage import atomic_write_text, get_config_dir
+from excelmcp.storage import atomic_write_text, get_config_dir, log
 
 SCOPES = ["Files.Read.All"]
 _PROACTIVE_REFRESH_SECONDS = 600  # refresh if token expires within 10 minutes
@@ -60,7 +60,7 @@ def _persist(cache: msal.SerializableTokenCache) -> None:
         atomic_write_text(get_token_cache_path(), cache.serialize(), sensitive=True)
     except OSError as exc:
         # A cache we cannot persist costs us a re-auth next run — not fatal now.
-        print(f"[Auth] Warning: could not save token cache: {exc}")
+        log(f"[Auth] Warning: could not save token cache: {exc}")
 
 
 def _is_spent_code(result: dict) -> bool:
@@ -76,10 +76,9 @@ def _is_expired_code(result: dict) -> bool:
 
 
 def _print_device_code(flow: dict) -> None:
-    print(
+    log(
         f"\nGo to {flow.get('verification_uri', 'https://microsoft.com/devicelogin')} "
         f"and enter code: {flow['user_code']}\n",
-        flush=True,
     )
 
 
@@ -113,15 +112,14 @@ async def _run_device_flow(
             break
 
         if _is_spent_code(last):
-            print(
+            log(
                 "[Auth] The sign-in completed but the confirmation did not reach us, "
                 "so that code is now spent. Starting a new one.",
-                flush=True,
             )
             continue
 
         if _is_expired_code(last):
-            print("[Auth] That code expired before sign-in finished. Here is a new one.", flush=True)
+            log("[Auth] That code expired before sign-in finished. Here is a new one.")
             continue
 
         break
@@ -167,7 +165,7 @@ async def get_token(
         try:
             cache.deserialize(cache_path.read_text(encoding="utf-8"))
         except Exception:
-            print("[Auth] Existing token cache is unreadable — re-authenticating.")
+            log("[Auth] Existing token cache is unreadable — re-authenticating.")
 
     app = msal.PublicClientApplication(client_id, authority=authority, token_cache=cache)
 
@@ -192,5 +190,5 @@ async def get_token(
 
     result = await _run_device_flow(app, cache, on_device_code)
     _persist(cache)
-    print("[Auth] Authenticated successfully.", flush=True)
+    log("[Auth] Authenticated successfully.")
     return result["access_token"]

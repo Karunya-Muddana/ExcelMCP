@@ -20,6 +20,7 @@ from excelmcp.storage import (
     atomic_write_bytes,
     atomic_write_text,
     get_config_dir,
+    log,
     read_json,
 )
 
@@ -63,30 +64,30 @@ def _load() -> tuple[Optional[np.ndarray], list[dict]]:
     if not isinstance(metadata, list) or not metadata:
         _vectors, _metadata = None, []
         if _LEGACY_INDEX_PATH.exists():
-            print(
+            log(
                 "[Embed] Found an index from an older ExcelMCP version — "
                 "re-run excelmcp-setup to rebuild it."
             )
         else:
-            print("[Embed] No index found — run excelmcp-setup to build.")
+            log("[Embed] No index found — run excelmcp-setup to build.")
         return _vectors, _metadata
 
     if not VECTORS_PATH.exists():
-        print("[Embed] Metadata present but vectors missing — run excelmcp-setup.")
+        log("[Embed] Metadata present but vectors missing — run excelmcp-setup.")
         _vectors, _metadata = None, []
         return _vectors, _metadata
 
     try:
         vectors = np.load(VECTORS_PATH)
     except (OSError, ValueError) as exc:
-        print(f"[Embed] Could not read vectors ({exc}) — run excelmcp-setup to rebuild.")
+        log(f"[Embed] Could not read vectors ({exc}) — run excelmcp-setup to rebuild.")
         _vectors, _metadata = None, []
         return _vectors, _metadata
 
     # A crash between the two writes would previously leave them out of sync and
     # silently mis-attribute search hits to the wrong sheet.
     if vectors.ndim != 2 or vectors.shape[0] != len(metadata):
-        print(
+        log(
             f"[Embed] Index is inconsistent (vectors={getattr(vectors, 'shape', None)}, "
             f"metadata={len(metadata)}) — run excelmcp-setup to rebuild."
         )
@@ -95,7 +96,7 @@ def _load() -> tuple[Optional[np.ndarray], list[dict]]:
 
     _vectors = vectors.astype(np.float32, copy=False)
     _metadata = metadata
-    print(f"[Embed] Loaded {len(_metadata)} embeddings from disk.")
+    log(f"[Embed] Loaded {len(_metadata)} embeddings from disk.")
     return _vectors, _metadata
 
 
@@ -168,7 +169,7 @@ def update_embeddings(workspace_path: str, files_dict: dict[str, Any]) -> None:
     _vectors = merged_vectors
     _metadata = merged_metadata
 
-    print(
+    log(
         f"[Embed] Indexed {len(new_metadata)} sheet descriptions for "
         f"'{workspace_path}' ({len(merged_metadata)} total) → {VECTORS_PATH}"
     )
@@ -186,14 +187,14 @@ def search(workspace_path: str, query: str, n_results: int = 5) -> list[dict]:
     vectors, metadata = _load()
 
     if vectors is None or not metadata:
-        print("[Embed] Index is empty — run excelmcp-setup first.")
+        log("[Embed] Index is empty — run excelmcp-setup first.")
         return []
 
     candidate_idx = [
         i for i, m in enumerate(metadata) if m.get("workspace") == workspace_path
     ]
     if not candidate_idx:
-        print(f"[Embed] No sheets indexed for workspace '{workspace_path}'.")
+        log(f"[Embed] No sheets indexed for workspace '{workspace_path}'.")
         return []
 
     query_vec = _normalize(np.asarray(embed([query]), dtype=np.float32))[0]

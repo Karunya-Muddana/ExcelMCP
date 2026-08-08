@@ -12,6 +12,7 @@ from typing import Any, Optional
 import aiohttp
 
 from excelmcp.auth import get_token
+from excelmcp.storage import log
 
 GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
 
@@ -200,7 +201,7 @@ async def _request(
                         resp.headers.get("Retry-After"), rate_limit_retries
                     )
                     rate_limit_retries += 1
-                    print(
+                    log(
                         f"[Graph] Rate limited — retrying in {delay:.0f}s "
                         f"({rate_limit_retries}/{_MAX_RATE_LIMIT_RETRIES})..."
                     )
@@ -237,7 +238,7 @@ async def _request(
                             min(server_error_retries, len(_BACKOFF_SECONDS) - 1)
                         ]
                         server_error_retries += 1
-                        print(
+                        log(
                             f"[Graph] Server error {resp.status} — retrying in {delay}s "
                             f"(attempt {server_error_retries}/{_MAX_SERVER_ERROR_RETRIES})..."
                         )
@@ -266,7 +267,7 @@ async def _request(
                     min(connection_retries, len(_BACKOFF_SECONDS) - 1)
                 ]
                 connection_retries += 1
-                print(
+                log(
                     f"[Graph] Connection error — retrying in {delay}s "
                     f"(attempt {connection_retries}/{_MAX_SERVER_ERROR_RETRIES}): {exc}"
                 )
@@ -291,7 +292,7 @@ async def _get_children(url: str) -> list[dict[str, Any]]:
         url = data.get("@odata.nextLink")
         seen_pages += 1
         if seen_pages > 1000:  # guard against a pathological pagination loop
-            print("[Graph] Stopping pagination after 1000 pages.")
+            log("[Graph] Stopping pagination after 1000 pages.")
             break
     return items
 
@@ -303,7 +304,7 @@ async def _scan_recursive(children_url: str, depth: int = 0) -> list[dict[str, A
     recurse without bound or storm Graph with concurrent requests.
     """
     if depth >= _MAX_SCAN_DEPTH:
-        print(f"[Graph] Max scan depth {_MAX_SCAN_DEPTH} reached — not descending further.")
+        log(f"[Graph] Max scan depth {_MAX_SCAN_DEPTH} reached — not descending further.")
         return []
 
     semaphore = _get_scan_semaphore()

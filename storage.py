@@ -18,11 +18,22 @@ everywhere:
 
 import json
 import os
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any
 
 CONFIG_DIR_NAME = ".excelmcp"
+
+
+def log(message: str) -> None:
+    """Writes a diagnostic line to stderr, never stdout.
+
+    The MCP stdio transport owns stdout for JSON-RPC frames; any stray line
+    there desyncs the host agent's parser. Every runtime module must route its
+    diagnostics through here (cli.py is exempt — it is a terminal program).
+    """
+    print(message, file=sys.stderr, flush=True)
 
 _DIR_MODE = 0o700
 _FILE_MODE = 0o600
@@ -99,5 +110,5 @@ def read_json(path: Path, default: Any) -> Any:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
-        print(f"[Storage] Ignoring unreadable {path.name} ({exc}); treating as empty.")
+        log(f"[Storage] Ignoring unreadable {path.name} ({exc}); treating as empty.")
         return default

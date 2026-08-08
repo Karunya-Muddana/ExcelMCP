@@ -10,7 +10,7 @@ from excelmcp.graph_client import (
     get_used_range,
     list_excel_files,
 )
-from excelmcp.storage import atomic_write_text, get_config_dir, read_json
+from excelmcp.storage import atomic_write_text, get_config_dir, log, read_json
 
 
 def get_graph_path() -> Path:
@@ -89,7 +89,7 @@ async def discover_structure(folder_path: str) -> dict[str, Any]:
     graph.setdefault("workspaces", {})
 
     files = await list_excel_files(folder_path)
-    print(f"[Scan] Discovered {len(files)} files in {folder_path}. Analyzing structure...")
+    log(f"[Scan] Discovered {len(files)} files in {folder_path}. Analyzing structure...")
 
     # Built fresh rather than merged into the previous scan, so workbooks deleted
     # from OneDrive stop appearing in the graph as phantom files.
@@ -112,7 +112,7 @@ async def discover_structure(folder_path: str) -> dict[str, Any]:
         try:
             session_id = await create_session(item_id)
         except Exception as exc:
-            print(f"[Scan] No workbook session for '{file_name}' ({exc}) — reading directly.")
+            log(f"[Scan] No workbook session for '{file_name}' ({exc}) — reading directly.")
 
         try:
             sheets = await get_sheet_names(item_id, session_id or None)
@@ -121,7 +121,7 @@ async def discover_structure(folder_path: str) -> dict[str, Any]:
                     data = await get_used_range(item_id, sheet_name, session_id or None)
                     header_idx, columns = detect_header_row(data)
                     if not columns:
-                        print(f"[Scan] Sheet '{sheet_name}' in '{file_name}' is empty — skipped.")
+                        log(f"[Scan] Sheet '{sheet_name}' in '{file_name}' is empty — skipped.")
                         continue
                     entry["sheets"][sheet_name] = {
                         "header_row": header_idx + 1,
@@ -132,9 +132,9 @@ async def discover_structure(folder_path: str) -> dict[str, Any]:
                         "use_for": [],
                     }
                 except Exception as e:
-                    print(f"[Scan] Skipping sheet '{sheet_name}' in '{file_name}': {e}")
+                    log(f"[Scan] Skipping sheet '{sheet_name}' in '{file_name}': {e}")
         except Exception as e:
-            print(f"[Scan] Skipping file '{file_name}': {e}")
+            log(f"[Scan] Skipping file '{file_name}': {e}")
             continue
         finally:
             if session_id:
@@ -152,5 +152,5 @@ async def discover_structure(folder_path: str) -> dict[str, Any]:
     graph["workspaces"][folder_path] = workspace
 
     save_graph(graph)
-    print(f"[Scan] Structure graph saved to {get_graph_path()}")
+    log(f"[Scan] Structure graph saved to {get_graph_path()}")
     return workspace

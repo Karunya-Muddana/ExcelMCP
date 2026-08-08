@@ -6,6 +6,7 @@ import pandas as pd
 
 from excelmcp.embeddings import search
 from excelmcp.graph_client import GraphAPIError, get_used_range
+from excelmcp.storage import log
 from excelmcp.structure import load_graph
 
 # Hard ceiling on rows returned by a single tool call. An unfiltered sheet can
@@ -421,7 +422,7 @@ async def execute_cross_file_aggregate(
     for fname, result in zip(filenames, raw_results):
         if isinstance(result, Exception):
             failures.append({"file": fname, "error": str(result)})
-            print(f"[Warning] Skipped {fname}: {result}")
+            log(f"[Warning] Skipped {fname}: {result}")
         else:
             successes.append(result)
 
