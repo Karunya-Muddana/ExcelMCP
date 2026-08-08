@@ -406,8 +406,11 @@ async def cross_file_aggregate(
 @mcp.tool(
     description="""
 Returns structural metadata for one specific file —
-sheet names, column headers, and row counts.
-INSTANT — reads from cached graph.json, no API call.
+sheet names, column headers, and each sheet's
+approx_row_count AS OF THE LAST SCAN (this tool makes
+no API call, so the count is not live; treat it as an
+order-of-magnitude hint, not a current figure).
+INSTANT — reads from cached graph.json.
 Use before filter_sheet when you need to confirm the
 exact column names available in a specific file.
 """

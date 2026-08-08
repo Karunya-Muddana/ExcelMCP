@@ -338,10 +338,12 @@ async def execute_inspect_file(file_name: str, folder_path: str) -> dict:
         "file": file_name,
         "item_id": file_info.get("item_id", ""),
         "last_scanned": file_info.get("last_scanned", ""),
+        "row_counts_are": "as_of_last_scan",
         "sheets": {
             name: {
                 "header_row": s.get("header_row", 1),
                 "columns": s.get("columns", []),
+                "approx_row_count": s.get("approx_row_count"),
             }
             for name, s in file_info.get("sheets", {}).items()
         },

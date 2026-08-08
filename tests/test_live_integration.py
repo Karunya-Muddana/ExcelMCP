@@ -56,7 +56,12 @@ class TestStructureInvariant:
             for sheet_name, sheet in info.get("sheets", {}).items():
                 assert "values" not in sheet, f"cell values cached in {file_name}/{sheet_name}"
                 assert "rows" not in sheet, f"cell values cached in {file_name}/{sheet_name}"
-                assert set(sheet) <= {"header_row", "columns", "description", "use_for"}
+                assert set(sheet) <= {
+                    "header_row",
+                    "columns",
+                    "description",
+                    "approx_row_count",
+                }
 
     def test_every_file_has_an_item_id(self, workspace):
         for file_name, info in workspace["files"].items():

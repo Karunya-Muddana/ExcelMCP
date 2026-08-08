@@ -132,7 +132,6 @@ def update_embeddings(workspace_path: str, files_dict: dict[str, Any]) -> None:
                     "file": filename,
                     "sheet": sheet_name,
                     "description": description,
-                    "use_for": sheet_data.get("use_for", []),
                 }
             )
 

@@ -458,7 +458,7 @@ def _files(prefix):
     return {
         f"{prefix}.xlsx": {
             "sheets": {
-                "Sheet1": {"description": f"{prefix} sheet one", "use_for": []},
+                "Sheet1": {"description": f"{prefix} sheet one"},
             }
         }
     }
