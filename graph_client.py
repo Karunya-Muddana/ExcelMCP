@@ -6,6 +6,7 @@
 
 import asyncio
 import email.utils
+import os
 import urllib.parse
 from typing import Any, Optional
 
@@ -31,16 +32,27 @@ _MAX_ERROR_BODY_CHARS = 500
 # inside aiohttp.
 _TIMEOUT = aiohttp.ClientTimeout(total=120, sock_connect=15, sock_read=60)
 
-# OneDrive trees can be deep and wide. Recursing unbounded and fanning out with
-# an unbounded asyncio.gather produced hundreds of simultaneous requests, which
-# reliably triggered Graph throttling. Both dimensions are now capped.
+# OneDrive trees can be deep and wide, and cross-file tools fan out over every
+# matching workbook. Unbounded concurrency reliably triggers Graph throttling,
+# whose retry ladder then exhausts and lands files in skipped_files. Every
+# Graph request therefore passes through one shared semaphore, sized by
+# EXCELMCP_MAX_CONCURRENCY (default 8).
 _MAX_SCAN_DEPTH = 12
-_MAX_CONCURRENT_REQUESTS = 8
+_DEFAULT_MAX_CONCURRENT_REQUESTS = 8
 
 _session: Optional[aiohttp.ClientSession] = None
 _session_loop: Optional[asyncio.AbstractEventLoop] = None
-_scan_semaphore: Optional[asyncio.Semaphore] = None
-_scan_semaphore_loop: Optional[asyncio.AbstractEventLoop] = None
+_request_semaphore: Optional[asyncio.Semaphore] = None
+_request_semaphore_loop: Optional[asyncio.AbstractEventLoop] = None
+
+
+def max_concurrency() -> int:
+    raw = os.environ.get("EXCELMCP_MAX_CONCURRENCY", "")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_MAX_CONCURRENT_REQUESTS
+    return max(1, value)
 
 
 class GraphAPIError(Exception):
@@ -155,13 +167,13 @@ async def close_client() -> None:
     _session_loop = None
 
 
-def _get_scan_semaphore() -> asyncio.Semaphore:
-    global _scan_semaphore, _scan_semaphore_loop
+def _get_request_semaphore() -> asyncio.Semaphore:
+    global _request_semaphore, _request_semaphore_loop
     loop = asyncio.get_running_loop()
-    if _scan_semaphore is None or _scan_semaphore_loop is not loop:
-        _scan_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_REQUESTS)
-        _scan_semaphore_loop = loop
-    return _scan_semaphore
+    if _request_semaphore is None or _request_semaphore_loop is not loop:
+        _request_semaphore = asyncio.Semaphore(max_concurrency())
+        _request_semaphore_loop = loop
+    return _request_semaphore
 
 
 async def _request(
@@ -178,6 +190,27 @@ async def _request(
     session = await _get_session()
     token = await get_token()
 
+    # One gate for every Graph request, whatever the call path — scan
+    # recursion, per-sheet reads, cross-file fan-out. Callers may gather()
+    # as widely as they like; at most max_concurrency() requests are in
+    # flight. The permit is deliberately held across retry sleeps so a 429
+    # backs off the whole fleet, not just this request. Nothing else in this
+    # module may acquire the semaphore, or nesting could deadlock it.
+    async with _get_request_semaphore():
+        return await _request_locked(
+            session, method, url, req_headers, json_data, params, token
+        )
+
+
+async def _request_locked(
+    session: aiohttp.ClientSession,
+    method: str,
+    url: str,
+    req_headers: dict[str, str],
+    json_data: Optional[dict[str, Any]],
+    params: Optional[dict[str, str]],
+    token: str,
+) -> Optional[dict[str, Any]]:
     server_error_retries = 0
     rate_limit_retries = 0
     connection_retries = 0
@@ -300,16 +333,15 @@ async def _get_children(url: str) -> list[dict[str, Any]]:
 async def _scan_recursive(children_url: str, depth: int = 0) -> list[dict[str, Any]]:
     """Recursively collects .xlsx files from a folder and all its subfolders.
 
-    Depth-limited and throttled by a shared semaphore so a deep tree cannot
-    recurse without bound or storm Graph with concurrent requests.
+    Depth-limited so a pathological tree cannot recurse without bound.
+    Concurrency is bounded inside _request; acquiring the shared semaphore
+    here as well would nest acquisitions and risk deadlock.
     """
     if depth >= _MAX_SCAN_DEPTH:
         log(f"[Graph] Max scan depth {_MAX_SCAN_DEPTH} reached — not descending further.")
         return []
 
-    semaphore = _get_scan_semaphore()
-    async with semaphore:
-        items = await _get_children(children_url)
+    items = await _get_children(children_url)
 
     excel_files = [
         i

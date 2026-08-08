@@ -234,6 +234,183 @@ class TestZeroMatchDiagnostics:
         assert len(diag["conditions"][0]["distinct_values_present"]) == 20
 
 
+# ------------------------------------------------------ concurrency bound
+
+
+class TestMaxConcurrency:
+    def test_default_is_eight(self, monkeypatch):
+        monkeypatch.delenv("EXCELMCP_MAX_CONCURRENCY", raising=False)
+        assert graph_client.max_concurrency() == 8
+
+    def test_env_override(self, monkeypatch):
+        monkeypatch.setenv("EXCELMCP_MAX_CONCURRENCY", "16")
+        assert graph_client.max_concurrency() == 16
+
+    def test_garbage_falls_back(self, monkeypatch):
+        monkeypatch.setenv("EXCELMCP_MAX_CONCURRENCY", "lots")
+        assert graph_client.max_concurrency() == 8
+
+    def test_nonpositive_is_clamped_to_one(self, monkeypatch):
+        monkeypatch.setenv("EXCELMCP_MAX_CONCURRENCY", "0")
+        assert graph_client.max_concurrency() == 1
+
+    def test_requests_in_flight_never_exceed_the_bound(self, monkeypatch):
+        # 100 files used to mean 100 simultaneous usedRange requests, which
+        # Graph throttles hard enough to exhaust the retry ladder.
+        monkeypatch.setenv("EXCELMCP_MAX_CONCURRENCY", "2")
+        monkeypatch.setattr(graph_client, "_request_semaphore", None)
+        monkeypatch.setattr(graph_client, "_request_semaphore_loop", None)
+
+        async def fake_token(*args, **kwargs):
+            return "tok"
+
+        async def fake_session():
+            return object()
+
+        state = {"in_flight": 0, "peak": 0}
+
+        async def fake_locked(session, method, url, headers, json_data, params, token):
+            state["in_flight"] += 1
+            state["peak"] = max(state["peak"], state["in_flight"])
+            await asyncio.sleep(0.005)
+            state["in_flight"] -= 1
+            return {}
+
+        monkeypatch.setattr(graph_client, "get_token", fake_token)
+        monkeypatch.setattr(graph_client, "_get_session", fake_session)
+        monkeypatch.setattr(graph_client, "_request_locked", fake_locked)
+
+        async def run():
+            await asyncio.gather(
+                *[graph_client._request("GET", "http://x") for _ in range(12)]
+            )
+
+        asyncio.run(run())
+        assert state["peak"] <= 2
+        # Reset so later tests build a fresh semaphore on their own loop.
+        graph_client._request_semaphore = None
+        graph_client._request_semaphore_loop = None
+
+
+# ------------------------------------------------------ cross-file folding
+
+
+def _fold_workspace(n_files):
+    files = {
+        f"W{i}.xlsx": {
+            "item_id": f"w{i}",
+            "sheets": {"Data": {"header_row": 1, "columns": ["Type", "Qty"]}},
+        }
+        for i in range(n_files)
+    }
+    return {"workspaces": {"/ERP": {"files": files}}}
+
+
+class TestCrossFileFold:
+    """The incremental fold must agree with what pd.concat used to produce."""
+
+    def _patch(self, monkeypatch, frames_by_item, n_files):
+        monkeypatch.setattr(
+            query_engine, "load_graph", lambda: _fold_workspace(n_files)
+        )
+
+        async def fake_fetch(item_id, sheet_name, header_row=1, **kwargs):
+            frame = frames_by_item[item_id]
+            if isinstance(frame, Exception):
+                raise frame
+            return frame.copy()
+
+        monkeypatch.setattr(query_engine, "_fetch_sheet_data", fake_fetch)
+
+    def _run(self, operation, value_col="Qty"):
+        return asyncio.run(
+            query_engine.execute_cross_file_aggregate(
+                "/ERP", "Data", value_col, operation
+            )
+        )
+
+    def test_sum_folds_across_files(self, monkeypatch):
+        self._patch(
+            monkeypatch,
+            {
+                "w0": pd.DataFrame({"Type": ["a"], "Qty": [10]}),
+                "w1": pd.DataFrame({"Type": ["b", "b"], "Qty": [20, 30]}),
+            },
+            2,
+        )
+        result = self._run("sum")
+        assert result["total"] == 60.0
+        assert result["per_file"] == {"W0.xlsx": 10.0, "W1.xlsx": 50.0}
+        assert result["row_count"] == 3
+
+    def test_mean_stays_row_weighted(self, monkeypatch):
+        # (10 + 0+0+0) / 4 = 2.5 — NOT the mean of per-file means (5.0).
+        self._patch(
+            monkeypatch,
+            {
+                "w0": pd.DataFrame({"Type": ["a"], "Qty": [10]}),
+                "w1": pd.DataFrame({"Type": ["b"] * 3, "Qty": [0, 0, 0]}),
+            },
+            2,
+        )
+        assert self._run("mean")["total"] == 2.5
+
+    def test_min_max_ignore_non_numeric(self, monkeypatch):
+        self._patch(
+            monkeypatch,
+            {
+                "w0": pd.DataFrame({"Type": ["a"], "Qty": ["oops"]}),
+                "w1": pd.DataFrame({"Type": ["b", "b"], "Qty": [7, 2]}),
+            },
+            2,
+        )
+        assert self._run("min")["total"] == 2.0
+        assert self._run("max")["total"] == 7.0
+
+    def test_count_counts_non_null_only(self, monkeypatch):
+        self._patch(
+            monkeypatch,
+            {
+                "w0": pd.DataFrame({"Type": ["a", "a"], "Qty": [1, None]}),
+                "w1": pd.DataFrame({"Type": ["b"], "Qty": [3]}),
+            },
+            2,
+        )
+        assert self._run("count")["total"] == 2.0
+
+    def test_one_failed_file_is_skipped_and_flagged(self, monkeypatch):
+        self._patch(
+            monkeypatch,
+            {
+                "w0": pd.DataFrame({"Type": ["a"], "Qty": [10]}),
+                "w1": RuntimeError("network down"),
+            },
+            2,
+        )
+        result = self._run("sum")
+        assert result["total"] == 10.0
+        assert [f["file"] for f in result["skipped_files"]] == ["W1.xlsx"]
+        assert "skipped" in result["warning"]
+
+    def test_all_files_failing_raises(self, monkeypatch):
+        self._patch(
+            monkeypatch,
+            {"w0": RuntimeError("x"), "w1": RuntimeError("y")},
+            2,
+        )
+        with pytest.raises(Exception, match="All files failed"):
+            self._run("sum")
+
+    def test_column_missing_everywhere_raises(self, monkeypatch):
+        self._patch(
+            monkeypatch,
+            {"w0": pd.DataFrame({"Other": [1]}), "w1": pd.DataFrame({"Other": [2]})},
+            2,
+        )
+        with pytest.raises(ValueError, match="not found in any file"):
+            self._run("sum")
+
+
 # ------------------------------------------------- cross-file completeness
 
 

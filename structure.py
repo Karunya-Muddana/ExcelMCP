@@ -1,3 +1,4 @@
+import asyncio
 import difflib
 import json
 from datetime import datetime, timezone
@@ -170,27 +171,37 @@ async def discover_structure(folder_path: str) -> dict[str, Any]:
 
         try:
             sheets = await get_sheet_names(item_id, session_id or None)
-            for sheet_name in sheets:
+
+            # Sheets are read concurrently; the Graph client's shared
+            # semaphore keeps at most max_concurrency() requests in flight,
+            # so a 100-sheet workbook no longer costs 100 serial round-trips.
+            async def read_sheet(sheet_name: str) -> Any:
                 try:
-                    data = await get_used_range(item_id, sheet_name, session_id or None)
-                    header_idx, columns = detect_header_row(data)
-                    if not columns:
-                        log(f"[Scan] Sheet '{sheet_name}' in '{file_name}' is empty — skipped.")
-                        continue
-                    values = data.get("values", [])
-                    entry["sheets"][sheet_name] = {
-                        "header_row": header_idx + 1,
-                        "columns": columns,
-                        # A count, not cell values — recorded so inspect_file
-                        # can report size without a live call. Labelled
-                        # as_of_last_scan wherever it is surfaced.
-                        "approx_row_count": max(0, len(values) - header_idx - 1),
-                        "description": generate_sheet_description(
-                            file_name, sheet_name, columns
-                        ),
-                    }
-                except Exception as e:
-                    log(f"[Scan] Skipping sheet '{sheet_name}' in '{file_name}': {e}")
+                    return await get_used_range(item_id, sheet_name, session_id or None)
+                except Exception as exc:
+                    return exc
+
+            results = await asyncio.gather(*[read_sheet(s) for s in sheets])
+            for sheet_name, data in zip(sheets, results):
+                if isinstance(data, Exception):
+                    log(f"[Scan] Skipping sheet '{sheet_name}' in '{file_name}': {data}")
+                    continue
+                header_idx, columns = detect_header_row(data)
+                if not columns:
+                    log(f"[Scan] Sheet '{sheet_name}' in '{file_name}' is empty — skipped.")
+                    continue
+                values = data.get("values", [])
+                entry["sheets"][sheet_name] = {
+                    "header_row": header_idx + 1,
+                    "columns": columns,
+                    # A count, not cell values — recorded so inspect_file
+                    # can report size without a live call. Labelled
+                    # as_of_last_scan wherever it is surfaced.
+                    "approx_row_count": max(0, len(values) - header_idx - 1),
+                    "description": generate_sheet_description(
+                        file_name, sheet_name, columns
+                    ),
+                }
         except Exception as e:
             log(f"[Scan] Skipping file '{file_name}': {e}")
             continue

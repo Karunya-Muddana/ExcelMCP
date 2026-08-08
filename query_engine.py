@@ -491,62 +491,93 @@ async def execute_cross_file_aggregate(
             f"Unknown operation '{operation}'. Use: {', '.join(sorted(ops_allowed))}."
         )
 
-    async def fetch_file(file_name: str, file_info: dict) -> tuple[str, pd.DataFrame]:
-        header_row = file_info["sheets"][sheet_name].get("header_row", 1)
-        df = await _fetch_sheet_data(file_info["item_id"], sheet_name, header_row)
-        if conditions:
-            df = _apply_conditions(df, conditions)
-        return file_name, df
+    async def fetch_file(file_name: str, file_info: dict):
+        try:
+            header_row = file_info["sheets"][sheet_name].get("header_row", 1)
+            df = await _fetch_sheet_data(file_info["item_id"], sheet_name, header_row)
+            if conditions:
+                df = _apply_conditions(df, conditions)
+            return file_name, df, None
+        except Exception as exc:
+            return file_name, None, exc
 
-    filenames = [fn for fn, _ in matching]
-    raw_results = await asyncio.gather(
-        *[fetch_file(fn, fi) for fn, fi in matching], return_exceptions=True
-    )
-
-    successes: list[tuple[str, pd.DataFrame]] = []
+    # Results are folded incrementally as each file completes: one frame is
+    # held at a time instead of concatenating all of them. For mean, (sum,
+    # count) pairs accumulate so the result stays row-weighted — averaging
+    # per-file means would weight a 3-row file the same as a 30,000-row one.
+    # Concurrency is bounded by the Graph client's shared semaphore.
+    per_file: dict[str, Any] = {}
     failures: list[dict[str, str]] = []
-    for fname, result in zip(filenames, raw_results):
-        if isinstance(result, Exception):
-            failures.append({"file": fname, "error": str(result)})
-            log(f"[Warning] Skipped {fname}: {result}")
-        else:
-            successes.append(result)
+    missing_col: list[str] = []
+    total_sum = 0.0
+    total_count = 0
+    running_min: Optional[float] = None
+    running_max: Optional[float] = None
+    row_count = 0
 
-    if not successes:
+    for future in asyncio.as_completed(
+        [fetch_file(fn, fi) for fn, fi in matching]
+    ):
+        file_name, df, exc = await future
+        if exc is not None:
+            failures.append({"file": file_name, "error": str(exc)})
+            log(f"[Warning] Skipped {file_name}: {exc}")
+            continue
+        if value_col not in df.columns:
+            missing_col.append(file_name)
+            continue
+        row_count += len(df)
+
+        if operation == "count":
+            file_count = int(df[value_col].count())
+            per_file[file_name] = float(file_count)
+            total_count += file_count
+            continue
+
+        series = pd.to_numeric(df[value_col], errors="coerce")
+        file_val = series.agg(operation)
+        per_file[file_name] = float(file_val) if pd.notna(file_val) else None
+        total_sum += float(series.sum())
+        file_count = int(series.count())
+        total_count += file_count
+        if file_count:
+            file_min, file_max = float(series.min()), float(series.max())
+            running_min = (
+                file_min if running_min is None else min(running_min, file_min)
+            )
+            running_max = (
+                file_max if running_max is None else max(running_max, file_max)
+            )
+
+    if failures and len(failures) == len(matching):
         raise GraphAPIError(
             "All files failed to fetch. Cannot aggregate. "
             "Check OneDrive connectivity and try again. "
             + "; ".join(f"{f['file']}: {f['error']}" for f in failures)
         )
-
-    per_file: dict[str, Any] = {}
-    frames: list[pd.DataFrame] = []
-    missing_col: list[str] = []
-    for file_name, df in successes:
-        if value_col not in df.columns:
-            missing_col.append(file_name)
-            continue
-        if operation != "count":
-            df[value_col] = pd.to_numeric(df[value_col], errors="coerce")
-        file_val = df[value_col].agg(operation)
-        per_file[file_name] = float(file_val) if pd.notna(file_val) else None
-        frames.append(df)
-
-    if not frames:
+    if not per_file:
         raise ValueError(
             f"Column '{value_col}' not found in any file with sheet '{sheet_name}'."
         )
 
-    combined = pd.concat(frames, ignore_index=True)
-    if operation != "count":
-        combined[value_col] = pd.to_numeric(combined[value_col], errors="coerce")
-
-    if operation == "mean":
-        # Averaging per-file means would weight a 3-row file the same as a
-        # 30,000-row one. Aggregating the concatenated frame keeps it row-weighted.
-        total = combined[value_col].mean()
+    if operation == "sum":
+        total: Optional[float] = total_sum
+    elif operation == "count":
+        total = float(total_count)
+    elif operation == "mean":
+        total = total_sum / total_count if total_count else None
+    elif operation == "min":
+        total = running_min
     else:
-        total = combined[value_col].agg(operation)
+        total = running_max
+
+    # Completion order is nondeterministic; report in workspace order.
+    file_order = {fn: i for i, (fn, _) in enumerate(matching)}
+    per_file = {
+        fn: per_file[fn] for fn, _ in matching if fn in per_file
+    }
+    failures.sort(key=lambda f: file_order[f["file"]])
+    missing_col.sort(key=lambda fn: file_order[fn])
 
     warnings: list[str] = []
     if unmatched_files:
@@ -576,13 +607,13 @@ async def execute_cross_file_aggregate(
         )
 
     return {
-        "total": float(total) if pd.notna(total) else None,
+        "total": total,
         "operation": operation,
         "column": value_col,
         "per_file": per_file,
-        "files": [fn for fn, _ in successes if fn not in missing_col],
+        "files": list(per_file.keys()),
         "sheet": sheet_name,
-        "row_count": len(combined),
+        "row_count": row_count,
         "skipped_files": failures,
         "unmatched_files": unmatched_files,
         "warning": " ".join(warnings) if warnings else None,
