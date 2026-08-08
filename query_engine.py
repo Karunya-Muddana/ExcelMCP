@@ -215,6 +215,79 @@ def _exact_string_match(
     return series.astype(str).str.strip().str.casefold() == str(val).strip().casefold()
 
 
+def _equality_mask(series: pd.Series, val: Any, exact_case: bool) -> pd.Series:
+    """Mask for one equality comparison: numeric when both sides are numeric,
+    normalised-string otherwise."""
+    try:
+        numeric_val = float(val)
+        numeric_series = pd.to_numeric(series, errors="coerce")
+        if not numeric_series.isna().all():
+            return numeric_series == numeric_val
+    except (ValueError, TypeError):
+        pass
+    return _exact_string_match(series, val, exact_case)
+
+
+def _null_mask(series: pd.Series) -> pd.Series:
+    """Excel blanks arrive as None or empty strings — both count as null."""
+    return series.isna() | (series.astype(str).str.strip() == "")
+
+
+_STRUCTURED_OPS = ("in", "between", "is_null", "contains", "=", ">", ">=", "<", "<=")
+
+
+def _apply_structured_condition(
+    df: pd.DataFrame, col: str, spec: dict[str, Any], exact_case: bool
+) -> pd.DataFrame:
+    """Applies one dict-form condition; multiple operators AND together, so
+    {"Batch Date": {">=": "2026-01-01", "<": "2026-04-01"}} is a range."""
+    if not spec:
+        raise ValueError(
+            f"Condition on column '{col}' is an empty object. "
+            f"Use operators: {', '.join(_STRUCTURED_OPS)}."
+        )
+    for op, arg in spec.items():
+        if op == "in":
+            if not isinstance(arg, (list, tuple)) or not arg:
+                raise ValueError(
+                    f"'in' on column '{col}' needs a non-empty list, got {arg!r}."
+                )
+            mask = _equality_mask(df[col], arg[0], exact_case)
+            for candidate in arg[1:]:
+                mask |= _equality_mask(df[col], candidate, exact_case)
+            df = df[mask]
+        elif op == "between":
+            if not isinstance(arg, (list, tuple)) or len(arg) != 2:
+                raise ValueError(
+                    f"'between' on column '{col}' needs [low, high], got {arg!r}."
+                )
+            df = _numeric_compare(df, col, str(arg[0]), ">=")
+            df = _numeric_compare(df, col, str(arg[1]), "<=")
+        elif op == "is_null":
+            if not isinstance(arg, bool):
+                raise ValueError(
+                    f"'is_null' on column '{col}' needs true or false, got {arg!r}."
+                )
+            mask = _null_mask(df[col])
+            df = df[mask] if arg else df[~mask]
+        elif op == "contains":
+            df = df[
+                df[col].astype(str).str.contains(
+                    str(arg), case=False, na=False, regex=False
+                )
+            ]
+        elif op == "=":
+            df = df[_equality_mask(df[col], arg, exact_case)]
+        elif op in (">", ">=", "<", "<="):
+            df = _numeric_compare(df, col, str(arg), op)
+        else:
+            raise ValueError(
+                f"Unknown operator '{op}' on column '{col}'. "
+                f"Use: {', '.join(_STRUCTURED_OPS)}."
+            )
+    return df
+
+
 def _apply_conditions(
     df: pd.DataFrame, conditions: dict[str, Any], exact_case: bool = False
 ) -> pd.DataFrame:
@@ -230,6 +303,10 @@ def _apply_conditions(
         )
 
     for col, val in conditions.items():
+        if isinstance(val, dict):
+            df = _apply_structured_condition(df, col, val, exact_case)
+            continue
+
         val_str = str(val)
 
         if val_str.startswith("~"):
@@ -251,15 +328,7 @@ def _apply_conditions(
         elif val_str.startswith("<"):
             df = _numeric_compare(df, col, val_str[1:], "<")
         else:
-            try:
-                numeric_val = float(val)
-                numeric_series = pd.to_numeric(df[col], errors="coerce")
-                if not numeric_series.isna().all():
-                    df = df[numeric_series == numeric_val]
-                else:
-                    df = df[_exact_string_match(df[col], val, exact_case)]
-            except (ValueError, TypeError):
-                df = df[_exact_string_match(df[col], val, exact_case)]
+            df = df[_equality_mask(df[col], val, exact_case)]
 
     # Filtering yields views; downstream code assigns to columns (to_numeric
     # coercion), which raises SettingWithCopyWarning and may not propagate.
@@ -540,11 +609,12 @@ async def execute_filter_sheet(
 async def execute_aggregate(
     file_name: str,
     sheet_name: str,
-    group_by: str,
+    group_by: Any,
     value_col: str,
     operation: str,
     conditions: Optional[dict[str, Any]],
     folder_path: str,
+    having: Optional[dict[str, Any]] = None,
 ) -> dict:
     folder_path = folder_path.rstrip("/")
     _, file_info = _get_file_info(folder_path, file_name)
@@ -562,15 +632,28 @@ async def execute_aggregate(
         raise ValueError(
             f"Unknown operation '{operation}'. Use: {', '.join(sorted(ops_allowed))}."
         )
+    group_cols = group_by if isinstance(group_by, list) else [group_by]
+    if not group_cols or not all(isinstance(g, str) and g for g in group_cols):
+        raise ValueError(
+            f"group_by must be a column name or a list of them, got {group_by!r}."
+        )
     if value_col not in df.columns:
         raise ValueError(f"Column '{value_col}' not found. Available: {list(df.columns)}")
-    if group_by not in df.columns:
-        raise ValueError(f"Column '{group_by}' not found. Available: {list(df.columns)}")
+    missing_groups = [g for g in group_cols if g not in df.columns]
+    if missing_groups:
+        raise ValueError(
+            f"group_by column(s) {missing_groups} not found. "
+            f"Available: {list(df.columns)}"
+        )
 
     if operation != "count":
         df[value_col] = pd.to_numeric(df[value_col], errors="coerce")
 
-    result = getattr(df.groupby(group_by)[value_col], operation)().reset_index()
+    result = getattr(df.groupby(group_cols)[value_col], operation)().reset_index()
+    if having:
+        # The having clause filters aggregated rows with the same grammar as
+        # conditions — unknown columns still raise, naming what exists.
+        result = _apply_conditions(result, having)
     response = {
         "rows": _records(result.head(MAX_ROWS_RETURNED)),
         "file": file_name,

@@ -304,16 +304,23 @@ rows matching the given conditions. Always live — no cache.
 Use when you already know which file and sheet to query.
 Get column names from get_workspace_graph first.
 
-Condition formats:
+Condition formats (string form):
   Exact match:      {{"ColumnName": "value"}}
   Contains:         {{"ColumnName": "~value"}}   (literal, not regex)
-  Greater than:     {{"ColumnName": ">100"}}
-  Greater or equal: {{"ColumnName": ">=100"}}
-  Less than:        {{"ColumnName": "<100"}}
-  Less or equal:    {{"ColumnName": "<=100"}}
+  Comparisons:      {{"ColumnName": ">100"}}  (also >=, <, <=)
+  Date bounds:      {{"Batch Date": ">=2026-01-01"}}  (ISO-8601)
 
-Multiple conditions are ANDed together.
-An unknown column name is an error, not an empty result.
+Condition formats (object form, combinable):
+  IN list:    {{"Status": {{"in": ["Closed", "Shipped"]}}}}
+  Range:      {{"Qty": {{"between": [10, 500]}}}}
+  Date range: {{"Batch Date": {{">=": "2026-01-01", "<": "2026-04-01"}}}}
+  Null check: {{"Notes": {{"is_null": false}}}}
+  Contains:   {{"Name": {{"contains": "oxide"}}}}
+
+Multiple conditions are ANDed together; multiple
+operators inside one object are ANDed too.
+An unknown column name or operator is an error, not an
+empty result.
 
 MATCHING IS NORMALISED, NOT STRICT: exact string matches
 ignore case and surrounding whitespace ("closed" matches
@@ -362,6 +369,12 @@ async def filter_sheet(
     description="""
 Fetches a sheet LIVE and runs a grouped aggregation.
 Operations: sum, count, mean, min, max.
+group_by is one column name or a list of them.
+conditions filters rows before aggregating (same
+grammar as filter_sheet, including the object form).
+having filters the AGGREGATED rows afterwards, e.g.
+having={"Revenue": ">1000"} keeps only groups whose
+aggregate exceeds 1000.
 SINGLE FILE ONLY.
 For totals across multiple files you MUST use
 cross_file_aggregate instead — never use this tool
@@ -376,15 +389,16 @@ present — correct the condition and retry.
 async def aggregate(
     file_name: str,
     sheet: str,
-    group_by: str,
+    group_by: Any,
     value_col: str,
     operation: str,
     folder_path: Optional[str] = None,
     conditions: Optional[dict] = None,
+    having: Optional[dict] = None,
 ) -> dict:
     folder = _resolve_folder(folder_path)
     result = await execute_aggregate(
-        file_name, sheet, group_by, value_col, operation, conditions, folder
+        file_name, sheet, group_by, value_col, operation, conditions, folder, having
     )
     data = {"rows": result["rows"], "truncated": result["truncated"]}
     for extra in ("zero_match_diagnostics", "structure_drift"):

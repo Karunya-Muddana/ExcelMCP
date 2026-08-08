@@ -577,6 +577,143 @@ class TestHeaderDetection:
         assert not found
 
 
+# --------------------------------------------------- structured conditions
+
+
+class TestStructuredConditions:
+    def _orders(self):
+        return pd.DataFrame(
+            {
+                "Status": ["Closed", "Shipped", "Open", "closed "],
+                "Qty": [5, 50, 500, 5000],
+                "Batch Date": ["2026-01-15", "2026-02-01", "2026-05-01", ""],
+                "Notes": ["ok", "", None, "late"],
+            }
+        )
+
+    def test_in_list_normalises_like_exact_match(self):
+        out = query_engine._apply_conditions(
+            self._orders(), {"Status": {"in": ["Closed", "Shipped"]}}
+        )
+        assert out["Qty"].tolist() == [5, 50, 5000]  # 'closed ' matches too
+
+    def test_between_is_inclusive(self):
+        out = query_engine._apply_conditions(
+            self._orders(), {"Qty": {"between": [10, 500]}}
+        )
+        assert out["Qty"].tolist() == [50, 500]
+
+    def test_date_range_combines_two_operators(self):
+        out = query_engine._apply_conditions(
+            self._orders(),
+            {"Batch Date": {">=": "2026-01-01", "<": "2026-04-01"}},
+        )
+        assert out["Qty"].tolist() == [5, 50]
+
+    def test_is_null_treats_blank_strings_as_null(self):
+        out = query_engine._apply_conditions(
+            self._orders(), {"Notes": {"is_null": True}}
+        )
+        assert out["Qty"].tolist() == [50, 500]
+        out = query_engine._apply_conditions(
+            self._orders(), {"Notes": {"is_null": False}}
+        )
+        assert out["Qty"].tolist() == [5, 5000]
+
+    def test_flat_and_structured_forms_mix(self):
+        out = query_engine._apply_conditions(
+            self._orders(),
+            {"Status": {"in": ["Closed", "Open"]}, "Qty": ">100"},
+        )
+        assert out["Qty"].tolist() == [500, 5000]
+
+    def test_unknown_operator_raises(self):
+        with pytest.raises(ValueError, match="Unknown operator 'like'"):
+            query_engine._apply_conditions(
+                self._orders(), {"Status": {"like": "Closed"}}
+            )
+
+    def test_malformed_between_raises(self):
+        with pytest.raises(ValueError, match="between"):
+            query_engine._apply_conditions(
+                self._orders(), {"Qty": {"between": [10]}}
+            )
+
+    def test_empty_spec_raises(self):
+        with pytest.raises(ValueError, match="empty object"):
+            query_engine._apply_conditions(self._orders(), {"Qty": {}})
+
+    def test_unknown_column_still_fails_loud(self):
+        with pytest.raises(ValueError, match="not found"):
+            query_engine._apply_conditions(
+                self._orders(), {"Nope": {"in": ["x"]}}
+            )
+
+
+class TestAggregateGrammar:
+    @pytest.fixture(autouse=True)
+    def patched(self, monkeypatch):
+        graph = {
+            "workspaces": {
+                "/ERP": {
+                    "files": {
+                        "s.xlsx": {
+                            "item_id": "id1",
+                            "sheets": {
+                                "Data": {
+                                    "header_row": 1,
+                                    "columns": ["Region", "Type", "Revenue"],
+                                }
+                            },
+                        }
+                    }
+                }
+            }
+        }
+        monkeypatch.setattr(query_engine, "load_graph", lambda: graph)
+
+        async def fake_fetch(item_id, sheet_name, sheet_info=None):
+            return (
+                pd.DataFrame(
+                    {
+                        "Region": ["N", "N", "S", "S"],
+                        "Type": ["a", "b", "a", "a"],
+                        "Revenue": [100, 200, 300, 400],
+                    }
+                ),
+                None,
+            )
+
+        monkeypatch.setattr(query_engine, "_fetch_sheet_data", fake_fetch)
+
+    def _agg(self, group_by, having=None):
+        return asyncio.run(
+            query_engine.execute_aggregate(
+                "s.xlsx", "Data", group_by, "Revenue", "sum", None, "/ERP", having
+            )
+        )
+
+    def test_multi_column_group_by(self):
+        rows = self._agg(["Region", "Type"])["rows"]
+        assert {"Region": "S", "Type": "a", "Revenue": 700.0} in [
+            {k: v for k, v in r.items()} for r in rows
+        ]
+        assert len(rows) == 3
+
+    def test_having_filters_aggregated_rows(self):
+        rows = self._agg("Region", having={"Revenue": ">400"})["rows"]
+        assert len(rows) == 1
+        assert rows[0]["Region"] == "S"
+
+    def test_having_unknown_column_raises(self):
+        with pytest.raises(ValueError, match="not found"):
+            self._agg("Region", having={"Nope": ">1"})
+
+    def test_unknown_group_column_raises(self):
+        with pytest.raises(ValueError, match="group_by column"):
+            self._agg(["Region", "Nope"])
+
+
 # --------------------------------------------------------- structure drift
 
 
