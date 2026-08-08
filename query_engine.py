@@ -103,7 +103,24 @@ def _numeric_compare(df: pd.DataFrame, col: str, raw: str, op: str) -> pd.DataFr
     return df[series <= bound]
 
 
-def _apply_conditions(df: pd.DataFrame, conditions: dict[str, Any]) -> pd.DataFrame:
+def _exact_string_match(
+    series: pd.Series, val: Any, exact_case: bool
+) -> pd.Series:
+    """Equality mask for string comparison.
+
+    Excel cells routinely carry trailing whitespace and inconsistent casing, so
+    the default comparison strips and casefolds both sides — {"Status":
+    "closed"} matches "Closed " rather than confidently returning zero rows.
+    exact_case=True restores byte-for-byte matching.
+    """
+    if exact_case:
+        return series.astype(str) == str(val)
+    return series.astype(str).str.strip().str.casefold() == str(val).strip().casefold()
+
+
+def _apply_conditions(
+    df: pd.DataFrame, conditions: dict[str, Any], exact_case: bool = False
+) -> pd.DataFrame:
     if not isinstance(conditions, dict):
         raise ValueError("conditions must be an object mapping column names to values.")
 
@@ -143,13 +160,46 @@ def _apply_conditions(df: pd.DataFrame, conditions: dict[str, Any]) -> pd.DataFr
                 if not numeric_series.isna().all():
                     df = df[numeric_series == numeric_val]
                 else:
-                    df = df[df[col].astype(str) == str(val)]
+                    df = df[_exact_string_match(df[col], val, exact_case)]
             except (ValueError, TypeError):
-                df = df[df[col].astype(str) == str(val)]
+                df = df[_exact_string_match(df[col], val, exact_case)]
 
     # Filtering yields views; downstream code assigns to columns (to_numeric
     # coercion), which raises SettingWithCopyWarning and may not propagate.
     return df.copy()
+
+
+def _zero_match_diagnostics(
+    df: pd.DataFrame, conditions: dict[str, Any], exact_case: bool = False
+) -> dict[str, Any]:
+    """Explains a zero-row result so the agent can self-correct.
+
+    'rows: []' with no signal reads as "no such orders exist" and gets reported
+    with full confidence. Showing what each condition matched alone, plus the
+    values actually present in the offending column, turns that into a retry.
+    """
+    per_condition: list[dict[str, Any]] = []
+    for col, val in conditions.items():
+        matched_alone = len(_apply_conditions(df, {col: val}, exact_case))
+        entry: dict[str, Any] = {
+            "column": col,
+            "condition": val,
+            "rows_matching_this_condition_alone": matched_alone,
+        }
+        if matched_alone == 0:
+            distinct = (
+                df[col].dropna().astype(str).str.strip().drop_duplicates().head(20)
+            )
+            entry["distinct_values_present"] = distinct.tolist()
+        per_condition.append(entry)
+    return {
+        "note": (
+            "No rows matched the combined conditions. Conditions that matched "
+            "zero rows on their own include a sample of the values actually "
+            "present in that column — check for a near-miss and retry."
+        ),
+        "conditions": per_condition,
+    }
 
 
 def _get_file_info(folder_path: str, file_name: str) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -305,15 +355,17 @@ async def execute_filter_sheet(
     sort_by: Optional[str],
     limit: Optional[int],
     folder_path: str,
+    exact_case: bool = False,
 ) -> dict:
     folder_path = folder_path.rstrip("/")
     effective_limit = _clamp_limit(limit)
     _, file_info = _get_file_info(folder_path, file_name)
     header_row = _resolve_sheet(file_info, sheet_name, file_name)
-    df = await _fetch_sheet_data(file_info["item_id"], sheet_name, header_row)
+    full_df = await _fetch_sheet_data(file_info["item_id"], sheet_name, header_row)
 
+    df = full_df
     if conditions:
-        df = _apply_conditions(df, conditions)
+        df = _apply_conditions(df, conditions, exact_case)
 
     if sort_by:
         if sort_by not in df.columns:
@@ -324,7 +376,7 @@ async def execute_filter_sheet(
 
     total_matched = len(df)
     result_df = df.head(effective_limit)
-    return {
+    result = {
         "rows": _records(result_df),
         "file": file_name,
         "sheet": sheet_name,
@@ -332,6 +384,11 @@ async def execute_filter_sheet(
         "total_matched": total_matched,
         "truncated": total_matched > len(result_df),
     }
+    if total_matched == 0 and conditions and not full_df.empty:
+        result["zero_match_diagnostics"] = _zero_match_diagnostics(
+            full_df, conditions, exact_case
+        )
+    return result
 
 
 async def execute_aggregate(
@@ -346,8 +403,9 @@ async def execute_aggregate(
     folder_path = folder_path.rstrip("/")
     _, file_info = _get_file_info(folder_path, file_name)
     header_row = _resolve_sheet(file_info, sheet_name, file_name)
-    df = await _fetch_sheet_data(file_info["item_id"], sheet_name, header_row)
+    full_df = await _fetch_sheet_data(file_info["item_id"], sheet_name, header_row)
 
+    df = full_df
     if conditions:
         df = _apply_conditions(df, conditions)
 
@@ -365,13 +423,18 @@ async def execute_aggregate(
         df[value_col] = pd.to_numeric(df[value_col], errors="coerce")
 
     result = getattr(df.groupby(group_by)[value_col], operation)().reset_index()
-    return {
+    response = {
         "rows": _records(result.head(MAX_ROWS_RETURNED)),
         "file": file_name,
         "sheet": sheet_name,
         "row_count": min(len(result), MAX_ROWS_RETURNED),
         "truncated": len(result) > MAX_ROWS_RETURNED,
     }
+    if df.empty and conditions and not full_df.empty:
+        response["zero_match_diagnostics"] = _zero_match_diagnostics(
+            full_df, conditions
+        )
+    return response
 
 
 async def execute_cross_file_aggregate(

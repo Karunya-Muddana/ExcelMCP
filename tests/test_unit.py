@@ -179,6 +179,61 @@ class TestConditions:
         assert out["Qty"].tolist() == [20, 300]
 
 
+def _status_frame():
+    return pd.DataFrame(
+        {
+            "Status": ["Closed", "Closed ", "closed", "Open"],
+            "Qty": [1, 2, 3, 4],
+        }
+    )
+
+
+class TestNormalisedMatching:
+    def test_exact_match_ignores_case_and_whitespace(self):
+        # {"Status": "closed"} returning zero rows against a sheet containing
+        # "Closed " made agents report "no closed orders" with full confidence.
+        out = query_engine._apply_conditions(_status_frame(), {"Status": "closed"})
+        assert len(out) == 3
+
+    def test_exact_case_flag_restores_strict_matching(self):
+        out = query_engine._apply_conditions(
+            _status_frame(), {"Status": "Closed"}, exact_case=True
+        )
+        assert len(out) == 1
+        assert out["Qty"].tolist() == [1]
+
+    def test_numeric_equality_still_works(self):
+        out = query_engine._apply_conditions(_status_frame(), {"Qty": 2})
+        assert out["Status"].tolist() == ["Closed "]
+
+
+class TestZeroMatchDiagnostics:
+    def test_offending_column_lists_actual_values(self):
+        diag = query_engine._zero_match_diagnostics(
+            _status_frame(), {"Status": "Shipped"}
+        )
+        (entry,) = diag["conditions"]
+        assert entry["column"] == "Status"
+        assert entry["rows_matching_this_condition_alone"] == 0
+        assert "Closed" in entry["distinct_values_present"]
+        assert "Open" in entry["distinct_values_present"]
+
+    def test_individually_matching_conditions_show_their_counts(self):
+        # Each condition matches alone; only the combination is empty.
+        diag = query_engine._zero_match_diagnostics(
+            _status_frame(), {"Status": "Open", "Qty": "<4"}
+        )
+        by_col = {e["column"]: e for e in diag["conditions"]}
+        assert by_col["Status"]["rows_matching_this_condition_alone"] == 1
+        assert by_col["Qty"]["rows_matching_this_condition_alone"] == 3
+        assert "distinct_values_present" not in by_col["Status"]
+
+    def test_distinct_values_are_capped_at_twenty(self):
+        df = pd.DataFrame({"Code": [f"C{i}" for i in range(50)]})
+        diag = query_engine._zero_match_diagnostics(df, {"Code": "nope"})
+        assert len(diag["conditions"][0]["distinct_values_present"]) == 20
+
+
 # ------------------------------------------------- cross-file completeness
 
 

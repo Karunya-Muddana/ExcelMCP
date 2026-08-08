@@ -264,6 +264,17 @@ Condition formats:
 
 Multiple conditions are ANDed together.
 An unknown column name is an error, not an empty result.
+
+MATCHING IS NORMALISED, NOT STRICT: exact string matches
+ignore case and surrounding whitespace ("closed" matches
+"Closed "), because Excel cells carry stray whitespace
+constantly. Pass exact_case=true for byte-for-byte
+matching. Contains (~) is case-insensitive.
+If zero rows match, the response includes
+zero_match_diagnostics showing what each condition
+matched on its own and the values actually present in
+the column — use it to correct a near-miss and retry
+instead of concluding the data does not exist.
 At most {MAX_ROWS_RETURNED} rows are returned; check the
 truncated and total_matched fields in the response.
 """
@@ -275,17 +286,21 @@ async def filter_sheet(
     folder_path: Optional[str] = None,
     sort_by: Optional[str] = None,
     limit: Optional[int] = None,
+    exact_case: bool = False,
 ) -> dict:
     folder = _resolve_folder(folder_path)
     result = await execute_filter_sheet(
-        file_name, sheet, conditions, sort_by, limit, folder
+        file_name, sheet, conditions, sort_by, limit, folder, exact_case
     )
+    data = {
+        "rows": result["rows"],
+        "total_matched": result["total_matched"],
+        "truncated": result["truncated"],
+    }
+    if "zero_match_diagnostics" in result:
+        data["zero_match_diagnostics"] = result["zero_match_diagnostics"]
     return wrap_response(
-        {
-            "rows": result["rows"],
-            "total_matched": result["total_matched"],
-            "truncated": result["truncated"],
-        },
+        data,
         [result["file"]],
         [result["sheet"]],
         result["row_count"],
@@ -301,6 +316,10 @@ For totals across multiple files you MUST use
 cross_file_aggregate instead — never use this tool
 and then manually add results across files.
 Get column names from get_workspace_graph first.
+Returns rows plus a truncated flag. If conditions
+matched zero rows, zero_match_diagnostics shows what
+each condition matched alone and the values actually
+present — correct the condition and retry.
 """
 )
 async def aggregate(
@@ -316,8 +335,11 @@ async def aggregate(
     result = await execute_aggregate(
         file_name, sheet, group_by, value_col, operation, conditions, folder
     )
+    data = {"rows": result["rows"], "truncated": result["truncated"]}
+    if "zero_match_diagnostics" in result:
+        data["zero_match_diagnostics"] = result["zero_match_diagnostics"]
     return wrap_response(
-        result["rows"],
+        data,
         [result["file"]],
         [result["sheet"]],
         result["row_count"],
