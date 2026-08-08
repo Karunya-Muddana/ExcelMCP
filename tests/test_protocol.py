@@ -18,6 +18,17 @@ def _frame(obj: dict) -> bytes:
 
 
 def test_stdout_is_pure_jsonrpc(tmp_path):
+    # One retry: on a cloud-synced checkout (OneDrive), the first subprocess
+    # spawn after source edits can hit transiently locked files mid-import
+    # and die before answering. That is a filesystem artefact, not the
+    # protocol regression this test exists to catch.
+    try:
+        _run_protocol_conversation(tmp_path)
+    except AssertionError:
+        _run_protocol_conversation(tmp_path)
+
+
+def _run_protocol_conversation(tmp_path):
     env = dict(os.environ)
     # Point ~ at tmp_path so the subprocess can never read or write the real
     # ~/.excelmcp, and so the query call takes the "no index found" diagnostic
