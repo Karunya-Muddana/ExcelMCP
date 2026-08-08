@@ -8,10 +8,12 @@ from typing import Any, Iterable
 from excelmcp.graph_client import (
     close_session,
     create_session,
+    get_range,
     get_sheet_names,
     get_used_range,
     list_excel_files,
 )
+from excelmcp.ranges import build_range, parse_range
 from excelmcp.storage import atomic_write_text, get_config_dir, log, read_json
 
 
@@ -101,37 +103,110 @@ def _deduplicate_columns(columns: list[str]) -> list[str]:
     return result
 
 
-def detect_header_row(used_range_data: dict[str, Any]) -> tuple[int, list[str]]:
+def columns_from_row(row: list[Any]) -> list[str]:
+    """Turns one raw sheet row into cleaned, deduplicated column names."""
+    columns = [
+        str(c).strip() if c is not None and str(c).strip() else f"Column_{i}"
+        for i, c in enumerate(row)
+    ]
+    return _deduplicate_columns(columns)
+
+
+def detect_header_row(used_range_data: dict[str, Any]) -> tuple[int, list[str], bool]:
     """
     Detects the first row that looks like a header: >= 2 non-empty cells where
     at least half are strings. Skips single-cell title rows.
+
+    Returns (row_index, columns, found). found=False means nothing matched the
+    heuristic and the first row was used as a fallback — callers scanning a
+    bounded window use it to decide whether a wider read is worth it.
     """
     values = used_range_data.get("values", [])
     if not values:
-        return 0, []
+        return 0, [], False
 
     for idx, row in enumerate(values):
         non_empty = [c for c in row if c is not None and str(c).strip()]
         string_cells = [c for c in non_empty if isinstance(c, str)]
 
         if len(non_empty) >= 2 and len(string_cells) >= len(non_empty) / 2:
-            columns = [
-                str(c).strip() if c is not None and str(c).strip() else f"Column_{i}"
-                for i, c in enumerate(row)
-            ]
-            return idx, _deduplicate_columns(columns)
+            return idx, columns_from_row(row), True
 
-    first_row = values[0]
-    columns = [
-        str(c).strip() if c is not None and str(c).strip() else f"Column_{i}"
-        for i, c in enumerate(first_row)
-    ]
-    return 0, _deduplicate_columns(columns)
+    return 0, columns_from_row(values[0]), False
 
 
 def generate_sheet_description(file_name: str, sheet_name: str, columns: list[str]) -> str:
     cols_str = ", ".join(columns)
     return f"Data sheet '{sheet_name}' in workbook '{file_name}'. Contains columns: {cols_str}."
+
+
+# Header detection reads a bounded window rather than the whole sheet: ten
+# rows is where real headers live (title rows above them are rare and short),
+# and 52 columns (A..AZ) covers the window; wider sheets get their header row
+# fetched separately at full width.
+_HEADER_WINDOW_ROWS = 10
+_SCAN_WINDOW_COLS = 52
+
+
+async def _scan_sheet_structure(
+    item_id: str, sheet_name: str, session_id: Any
+) -> dict[str, Any] | None:
+    """Reads just enough of a sheet to learn its structure. Returns None if empty.
+
+    Scanning used to download every sheet in full purely to find the header
+    row index. Now: one metadata call for the used-range address and
+    dimensions, one bounded window read for header detection, and a full read
+    only if no header shows up in the first _HEADER_WINDOW_ROWS rows.
+    """
+    meta = await get_used_range(
+        item_id, sheet_name, session_id, select="address,rowCount,columnCount"
+    )
+    address = str(meta.get("address") or "")
+    row_count = int(meta.get("rowCount") or 0)
+    column_count = int(meta.get("columnCount") or 0)
+    if not address or row_count <= 0 or column_count <= 0:
+        return None
+
+    col1, row1, col2, row2 = parse_range(address)
+    window_address = build_range(
+        col1,
+        row1,
+        min(col2, col1 + _SCAN_WINDOW_COLS - 1),
+        min(row2, row1 + _HEADER_WINDOW_ROWS - 1),
+    )
+    window = await get_range(item_id, sheet_name, window_address, session_id)
+    header_idx, columns, found = detect_header_row(window)
+
+    if not found and row_count > _HEADER_WINDOW_ROWS:
+        full = await get_used_range(item_id, sheet_name, session_id)
+        header_idx, columns, found = detect_header_row(full)
+
+    if not columns:
+        return None
+
+    if column_count > _SCAN_WINDOW_COLS:
+        # The detection window is capped at 52 columns; re-read the header row
+        # at full width so wide sheets don't lose column names.
+        header_row_address = build_range(
+            col1, row1 + header_idx, col2, row1 + header_idx
+        )
+        header_data = await get_range(
+            item_id, sheet_name, header_row_address, session_id
+        )
+        header_values = (header_data.get("values") or [[]])[0]
+        if header_values:
+            columns = columns_from_row(header_values)
+
+    return {
+        "header_row": header_idx + 1,
+        "columns": columns,
+        "used_range_address": address,
+        "row_count": row_count,
+        "column_count": column_count,
+        # A count, not cell values — recorded so inspect_file can report
+        # size without a live call. Labelled as_of_last_scan where surfaced.
+        "approx_row_count": max(0, row_count - header_idx - 1),
+    }
 
 
 async def discover_structure(folder_path: str) -> dict[str, Any]:
@@ -177,31 +252,24 @@ async def discover_structure(folder_path: str) -> dict[str, Any]:
             # so a 100-sheet workbook no longer costs 100 serial round-trips.
             async def read_sheet(sheet_name: str) -> Any:
                 try:
-                    return await get_used_range(item_id, sheet_name, session_id or None)
+                    return await _scan_sheet_structure(
+                        item_id, sheet_name, session_id or None
+                    )
                 except Exception as exc:
                     return exc
 
             results = await asyncio.gather(*[read_sheet(s) for s in sheets])
-            for sheet_name, data in zip(sheets, results):
-                if isinstance(data, Exception):
-                    log(f"[Scan] Skipping sheet '{sheet_name}' in '{file_name}': {data}")
+            for sheet_name, sheet_entry in zip(sheets, results):
+                if isinstance(sheet_entry, Exception):
+                    log(f"[Scan] Skipping sheet '{sheet_name}' in '{file_name}': {sheet_entry}")
                     continue
-                header_idx, columns = detect_header_row(data)
-                if not columns:
+                if sheet_entry is None:
                     log(f"[Scan] Sheet '{sheet_name}' in '{file_name}' is empty — skipped.")
                     continue
-                values = data.get("values", [])
-                entry["sheets"][sheet_name] = {
-                    "header_row": header_idx + 1,
-                    "columns": columns,
-                    # A count, not cell values — recorded so inspect_file
-                    # can report size without a live call. Labelled
-                    # as_of_last_scan wherever it is surfaced.
-                    "approx_row_count": max(0, len(values) - header_idx - 1),
-                    "description": generate_sheet_description(
-                        file_name, sheet_name, columns
-                    ),
-                }
+                sheet_entry["description"] = generate_sheet_description(
+                    file_name, sheet_name, sheet_entry["columns"]
+                )
+                entry["sheets"][sheet_name] = sheet_entry
         except Exception as e:
             log(f"[Scan] Skipping file '{file_name}': {e}")
             continue

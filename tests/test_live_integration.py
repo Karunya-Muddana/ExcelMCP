@@ -61,6 +61,9 @@ class TestStructureInvariant:
                     "columns",
                     "description",
                     "approx_row_count",
+                    "used_range_address",
+                    "row_count",
+                    "column_count",
                 }
 
     def test_every_file_has_an_item_id(self, workspace):

@@ -550,22 +550,135 @@ class TestClampLimit:
 class TestHeaderDetection:
     def test_skips_title_row(self):
         data = {"values": [["Quarterly Report"], ["Name", "Qty"], ["a", 1]]}
-        idx, cols = structure.detect_header_row(data)
+        idx, cols, found = structure.detect_header_row(data)
         assert idx == 1
         assert cols == ["Name", "Qty"]
+        assert found
 
     def test_deduplicates_repeated_headers(self):
         data = {"values": [["Name", "Name", "Qty"]]}
-        _, cols = structure.detect_header_row(data)
+        _, cols, _ = structure.detect_header_row(data)
         assert cols == ["Name", "Name_1", "Qty"]
 
     def test_blank_cells_get_positional_names(self):
         data = {"values": [["Name", "", "Qty"]]}
-        _, cols = structure.detect_header_row(data)
+        _, cols, _ = structure.detect_header_row(data)
         assert cols == ["Name", "Column_1", "Qty"]
 
     def test_empty_sheet(self):
-        assert structure.detect_header_row({"values": []}) == (0, [])
+        assert structure.detect_header_row({"values": []}) == (0, [], False)
+
+    def test_headerless_data_reports_not_found(self):
+        # All-numeric rows: the fallback picks row 0 but flags that nothing
+        # actually looked like a header, so scanners can widen the read.
+        data = {"values": [[1, 2], [3, 4]]}
+        idx, cols, found = structure.detect_header_row(data)
+        assert idx == 0
+        assert not found
+
+
+# ------------------------------------------------------------- A1 notation
+
+
+class TestRanges:
+    def test_col_roundtrip(self):
+        from excelmcp import ranges
+
+        for index, letters in [(1, "A"), (26, "Z"), (27, "AA"), (52, "AZ"), (703, "AAA")]:
+            assert ranges.index_to_col(index) == letters
+            assert ranges.col_to_index(letters) == index
+
+    def test_parse_strips_sheet_prefix(self):
+        from excelmcp import ranges
+
+        assert ranges.parse_range("Sheet1!B3:H500") == (2, 3, 8, 500)
+        assert ranges.parse_range("'My Sheet'!A1") == (1, 1, 1, 1)
+
+    def test_build_range_and_cell(self):
+        from excelmcp import ranges
+
+        assert ranges.build_range(2, 3, 8, 500) == "B3:H500"
+        assert ranges.build_cell(8, 347) == "H347"
+
+    def test_garbage_raises(self):
+        from excelmcp import ranges
+
+        with pytest.raises(ValueError):
+            ranges.parse_range("not-an-address")
+
+
+# ------------------------------------------------------- bounded scan reads
+
+
+class TestScanSheetStructure:
+    def _fakes(self, monkeypatch, meta, windows, full=None):
+        calls = []
+
+        async def fake_used_range(item_id, sheet, session=None, *, select=None, **kw):
+            if select and "values" not in select:
+                calls.append(("meta", select))
+                return meta
+            calls.append(("full", select))
+            return full or {"values": []}
+
+        async def fake_get_range(item_id, sheet, address, session=None, **kw):
+            calls.append(("range", address))
+            return windows[address]
+
+        monkeypatch.setattr(structure, "get_used_range", fake_used_range)
+        monkeypatch.setattr(structure, "get_range", fake_get_range)
+        return calls
+
+    def test_header_in_window_avoids_full_read(self, monkeypatch):
+        calls = self._fakes(
+            monkeypatch,
+            meta={"address": "Sheet1!A1:C500", "rowCount": 500, "columnCount": 3},
+            windows={"A1:C10": {"values": [["Name", "Qty", "Status"], ["a", 1, "x"]]}},
+        )
+        entry = asyncio.run(structure._scan_sheet_structure("i", "S", None))
+        assert entry["columns"] == ["Name", "Qty", "Status"]
+        assert entry["header_row"] == 1
+        assert entry["used_range_address"] == "Sheet1!A1:C500"
+        assert entry["row_count"] == 500
+        assert entry["approx_row_count"] == 499
+        # One metadata call, one window read — never the whole sheet.
+        assert [kind for kind, _ in calls] == ["meta", "range"]
+
+    def test_no_header_in_window_falls_back_to_full_read(self, monkeypatch):
+        numeric = {"values": [[1, 2]] * 10}
+        calls = self._fakes(
+            monkeypatch,
+            meta={"address": "Sheet1!A1:B40", "rowCount": 40, "columnCount": 2},
+            windows={"A1:B10": numeric},
+            full={"values": [[1, 2]] * 11 + [["Name", "Qty"], ["a", 1]]},
+        )
+        entry = asyncio.run(structure._scan_sheet_structure("i", "S", None))
+        assert entry["columns"] == ["Name", "Qty"]
+        assert entry["header_row"] == 12
+        assert [kind for kind, _ in calls] == ["meta", "range", "full"]
+
+    def test_empty_sheet_returns_none(self, monkeypatch):
+        self._fakes(
+            monkeypatch,
+            meta={"address": "", "rowCount": 0, "columnCount": 0},
+            windows={},
+        )
+        assert asyncio.run(structure._scan_sheet_structure("i", "S", None)) is None
+
+    def test_wide_sheet_refetches_header_row_at_full_width(self, monkeypatch):
+        wide_header = [f"C{i}" for i in range(60)]
+        calls = self._fakes(
+            monkeypatch,
+            meta={"address": "Sheet1!A1:BH100", "rowCount": 100, "columnCount": 60},
+            windows={
+                "A1:AZ10": {"values": [wide_header[:52], ["x"] * 52]},
+                "A1:BH1": {"values": [wide_header]},
+            },
+        )
+        entry = asyncio.run(structure._scan_sheet_structure("i", "S", None))
+        assert len(entry["columns"]) == 60
+        assert entry["columns"][-1] == "C59"
+        assert ("range", "A1:BH1") in calls
 
 
 # ---------------------------------------------------------------- storage
