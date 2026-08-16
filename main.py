@@ -199,6 +199,8 @@ def wrap_response(
 _SUMMARY_SHEET_KEYS = (
     "header_row",
     "header_source",
+    "header_confidence",
+    "placeholder_ratio",
     "columns",
     "column_types",
     "used_range_address",

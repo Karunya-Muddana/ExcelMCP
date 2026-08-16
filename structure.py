@@ -4,7 +4,7 @@ import json
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Optional
 
 from excelmcp.graph_client import (
     close_session,
@@ -172,27 +172,190 @@ def raw_columns_from_row(row: list[Any]) -> list[str]:
     return _deduplicate_columns(columns)
 
 
-def detect_header_row(used_range_data: dict[str, Any]) -> tuple[int, list[str], bool]:
-    """
-    Detects the first row that looks like a header: >= 2 non-empty cells where
-    at least half are strings. Skips single-cell title rows.
+# ------------------------------------------------------- header detection
+#
+# Header rows are scored, not first-matched. The old rule — first row with >= 2
+# non-empty cells, half of them strings — fails in both directions on real
+# workbooks: it takes a summary block near the top as the header on sheets that
+# open with one, and it has no way to argue with a formula-derived candidate
+# that is a row late whenever an `Opening Balance` line sits between the header
+# and the first row the totals cover.
+#
+# Scoring every plausible row against the data beneath it settles both cases
+# without privileging either source.
 
-    Returns (row_index, columns, found). found=False means nothing matched the
-    heuristic and the first row was used as a fallback — callers scanning a
-    bounded window use it to decide whether a wider read is worth it.
+_DATE_TEXT = re.compile(r"^\d{1,4}[-/.]\d{1,2}[-/.]\d{1,4}|^\d{4}-\d{2}-\d{2}")
+
+# A header cell is a label. Past this length it is a sentence, and a sentence
+# in the top rows is a note to the reader.
+_MAX_LABEL_LEN = 60
+
+# Rows below a candidate read as its body when scoring: enough to establish
+# each column's type profile, few enough that a totals block does not dilute it.
+_BODY_SAMPLE = 20
+
+# How deep a header can plausibly sit. Banners, section titles and summary
+# blocks stack up, but a header below this is not a header.
+_MAX_HEADER_DEPTH = 40
+
+# A candidate must be beaten by this margin to be displaced, so an established
+# answer does not flip on noise.
+_OVERRIDE_MARGIN = 0.08
+
+HEADER_CONFIDENT = 0.55
+HEADER_WEAK = 0.35
+
+
+def cell_kind(value: Any) -> str:
+    """empty | number | date | text — the shape of one cell, not its content."""
+    if value is None:
+        return "empty"
+    if isinstance(value, bool):
+        return "text"
+    if isinstance(value, (int, float)):
+        return "number"
+    text = str(value).strip()
+    if not text:
+        return "empty"
+    # Graph hands numbers back as strings often enough that treating '14000'
+    # as text would let a label/value row pass as a header.
+    try:
+        float(text.replace(",", "").replace("\u20b9", "").replace("%", ""))
+        return "number"
+    except ValueError:
+        pass
+    if _DATE_TEXT.match(text):
+        return "date"
+    return "text"
+
+
+def score_header_row(row: list[Any], body: list[list[Any]]) -> float:
+    """How much this row behaves like the header of ``body``. 0.0 to ~1.0.
+
+    Five signals, none decisive alone:
+
+    fill        A header names most of the columns its table uses.
+    text_ratio  Headers are labels; data rows carry numbers and dates.
+    uniqueness  Two columns rarely share a name; two data cells often share
+                a value.
+    contrast    What actually separates a header from the data row below it:
+                in the columns where this row holds text, the body should hold
+                something other than text. 'Qty (Kgs)' over a column of numbers
+                is a header. 'Opening Balance' over a column of dates is one
+                half of a label/value pair.
+    penalties   Numeric cells and sentence-length strings both count against.
+    """
+    width = max(len(row), 1)
+    kinds = [cell_kind(c) for c in row]
+    non_empty = [k for k in kinds if k != "empty"]
+    if len(non_empty) < 2:
+        # A single-cell row is a title or a section banner, never a header.
+        return 0.0
+
+    texts = [str(c).strip() for c, k in zip(row, kinds) if k == "text"]
+    fill = len(non_empty) / width
+    text_ratio = len(texts) / len(non_empty)
+    uniqueness = len({t.casefold() for t in texts}) / max(len(texts), 1)
+    numeric_penalty = sum(
+        1 for k in non_empty if k in ("number", "date")
+    ) / len(non_empty)
+    long_penalty = sum(1 for t in texts if len(t) > _MAX_LABEL_LEN) / max(
+        len(texts), 1
+    )
+
+    contrast = 0.0
+    text_cols = [i for i, k in enumerate(kinds) if k == "text"]
+    if body and text_cols:
+        differing = counted = 0
+        for i in text_cols:
+            below = [cell_kind(r[i]) for r in body if i < len(r)]
+            filled = [k for k in below if k != "empty"]
+            if not filled:
+                continue
+            counted += 1
+            if sum(1 for k in filled if k != "text") / len(filled) >= 0.5:
+                differing += 1
+        if counted:
+            contrast = differing / counted
+
+    score = (
+        0.30 * fill
+        + 0.30 * text_ratio
+        + 0.15 * uniqueness
+        + 0.25 * contrast
+        - 0.35 * numeric_penalty
+        - 0.10 * long_penalty
+    )
+    return max(0.0, score)
+
+
+def resolve_header_row(
+    values: list[list[Any]],
+    candidates: Optional[list[int]] = None,
+) -> tuple[int, float, str]:
+    """Best header row index, its score, and a confidence label.
+
+    ``candidates`` are indices another source already proposed — the
+    formula-derived row, a previous heuristic's pick. They are scored like any
+    other row and given a small margin, so an established answer is not
+    displaced by a coin-flip.
+    """
+    if not values:
+        return 0, 0.0, "unreliable"
+
+    candidates = candidates or []
+    depth = min(len(values), _MAX_HEADER_DEPTH)
+    considered = set(range(depth)) | {c for c in candidates if 0 <= c < len(values)}
+
+    scores = {
+        i: score_header_row(values[i], values[i + 1 : i + 1 + _BODY_SAMPLE])
+        for i in considered
+    }
+    # Earlier rows win ties: a header sits above its data, and a repeated
+    # header band further down should not outrank the first one.
+    best_idx = max(scores, key=lambda i: (scores[i], -i))
+    best_score = scores[best_idx]
+
+    for c in candidates:
+        if c in scores and scores[c] + _OVERRIDE_MARGIN >= best_score:
+            best_idx, best_score = c, scores[c]
+            break
+
+    if best_score >= HEADER_CONFIDENT:
+        confidence = "confident"
+    elif best_score >= HEADER_WEAK:
+        confidence = "weak"
+    else:
+        confidence = "unreliable"
+    return best_idx, round(best_score, 3), confidence
+
+
+def placeholder_ratio(columns: list[str]) -> float:
+    """Share of column names that are positional placeholders.
+
+    A high ratio means the detected row named almost nothing, and any tool
+    asked to aggregate over those names is working from a layout nobody
+    resolved — worth surfacing rather than letting a confident number out.
+    """
+    if not columns:
+        return 1.0
+    placeholders = sum(1 for c in columns if re.fullmatch(r"Column_\d+(_\d+)?", c))
+    return round(placeholders / len(columns), 3)
+
+
+def detect_header_row(used_range_data: dict[str, Any]) -> tuple[int, list[str], bool]:
+    """Detects the header row by scoring every plausible candidate.
+
+    Returns (row_index, columns, found). found=False means nothing scored well
+    enough to rely on — callers scanning a bounded window use it to decide
+    whether a wider read is worth it, and the caller records the confidence.
     """
     values = used_range_data.get("values", [])
     if not values:
         return 0, [], False
 
-    for idx, row in enumerate(values):
-        non_empty = [c for c in row if c is not None and str(c).strip()]
-        string_cells = [c for c in non_empty if isinstance(c, str)]
-
-        if len(non_empty) >= 2 and len(string_cells) >= len(non_empty) / 2:
-            return idx, columns_from_row(row), True
-
-    return 0, columns_from_row(values[0]), False
+    idx, score, confidence = resolve_header_row(values)
+    return idx, columns_from_row(values[idx]), confidence != "unreliable"
 
 
 # ------------------------------------------------------------ relationships
@@ -575,41 +738,54 @@ async def _scan_sheet_structure(
     block = window
     block_row1 = row1
 
-    # The first table body a formula names outranks the heuristic. The heuristic
-    # takes the first row that *looks* like a header, which on a sheet opening
-    # with a client banner or a summary block is the banner — and every row
-    # after it is then served as data. body_start - 1 is the row the workbook's
-    # own totals imply, and it is right far more often.
+    # The formula-derived body start and the scored candidate are both just
+    # candidates. body_start - 1 is right whenever the header sits directly
+    # above the totalled block, and a row late whenever an Opening Balance line
+    # sits between them — so it is scored against the data like anything else
+    # rather than trusted outright.
+    header_score = 0.0
+    header_confidence = "weak"
     primary_header = regions[0]["header_row"] if regions else None
     if primary_header is not None:
         if not (row1 <= primary_header <= min(row2, row1 + _HEADER_WINDOW_ROWS - 1)):
-            # The formula-derived header sits outside the detection window, so
-            # read a small block starting at it — values for the names,
-            # numberFormat for date detection.
-            block_row1 = primary_header
+            # The formula-derived candidate sits outside the detection window,
+            # so read a small block starting above it — far enough up to catch
+            # a header the totals do not point directly at.
+            block_row1 = max(row1, primary_header - 8)
             block = await get_range(
                 item_id,
                 sheet_name,
                 build_range(
                     col1,
-                    primary_header,
+                    block_row1,
                     min(col2, col1 + _SCAN_WINDOW_COLS - 1),
-                    min(row2, primary_header + _HEADER_WINDOW_ROWS - 1),
+                    min(row2, block_row1 + _HEADER_WINDOW_ROWS - 1),
                 ),
                 session_id,
                 select="values,numberFormat",
             )
-        candidate_idx = primary_header - block_row1
         block_values = block.get("values") or []
-        if 0 <= candidate_idx < len(block_values):
-            header_idx = candidate_idx
-            columns = columns_from_row(block_values[candidate_idx])
-            found = True
-            header_source = "formula"
+        candidate_idx = primary_header - block_row1
+        if block_values:
+            resolved, header_score, header_confidence = resolve_header_row(
+                block_values, [candidate_idx] if candidate_idx >= 0 else None
+            )
+            header_idx = resolved
+            columns = columns_from_row(block_values[resolved])
+            found = header_confidence != "unreliable"
+            header_source = (
+                "formula" if resolved == candidate_idx else "formula+scored"
+            )
         else:
-            # The read came back short of the row the formulas pointed at.
-            # Keep the heuristic's answer rather than indexing into nothing.
+            # The read came back empty. Keep the window's answer rather than
+            # indexing into nothing.
             block, block_row1 = window, row1
+    else:
+        block_values = block.get("values") or []
+        if block_values:
+            _, header_score, header_confidence = resolve_header_row(
+                block_values, [header_idx]
+            )
 
     column_types: dict[str, str] = {}
     if found:
@@ -692,6 +868,13 @@ async def _scan_sheet_structure(
         # confirmed it and nothing knows what the regions *mean*. An agent
         # should be able to see that a sheet has not been interpreted yet.
         "layout_confidence": "unconfirmed",
+        # How much the detected header row actually behaved like a header, and
+        # how much of the result is positional filler. A sheet whose columns are
+        # mostly Column_N was not interpreted, and a tool asked to aggregate
+        # over those names should say so instead of returning a number.
+        "header_confidence": header_confidence,
+        "header_score": header_score,
+        "placeholder_ratio": placeholder_ratio(columns),
     }
     if raw_columns != columns:
         entry["columns_raw"] = raw_columns
