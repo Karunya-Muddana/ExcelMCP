@@ -960,10 +960,12 @@ def _region_graph():
         {
             "type": "table", "range": "5:15", "body": "7:15",
             "header_row": 5, "source": "formula", "confidence": "unconfirmed",
+            "label": "NAPHTHALENE",
         },
         {
             "type": "table", "range": "18:28", "body": "20:28",
             "header_row": 19, "source": "formula", "confidence": "unconfirmed",
+            "label": "OLEUM 65%",
         },
     ]
     return {
@@ -1025,7 +1027,9 @@ class TestRegionScoping:
         by_span = self._filter("Two Tables", region="7:15")
         assert sorted(r["AbsRow"] for r in by_index["rows"]) == list(range(7, 16))
         assert sorted(r["AbsRow"] for r in by_span["rows"]) == list(range(7, 16))
-        assert by_index["region_used"] == {"index": 0, "body": "7:15", "row_count": 9}
+        assert by_index["region_used"] == {
+            "index": 0, "body": "7:15", "row_count": 9, "label": "NAPHTHALENE",
+        }
         assert by_span["region_used"] == by_index["region_used"]
 
     def test_second_region_is_disjoint_from_the_first(self):
@@ -1040,6 +1044,39 @@ class TestRegionScoping:
     def test_unmatched_span_errors_rather_than_falling_back_to_whole_sheet(self):
         with pytest.raises(ValueError, match="matches no region"):
             self._filter("Two Tables", region="100:200")
+
+    def test_exact_label_case_and_whitespace_insensitive(self):
+        result = self._filter("Two Tables", region="  naphthalene  ")
+        assert result["region_used"]["index"] == 0
+        assert result["region_used"]["label"] == "NAPHTHALENE"
+
+    def test_fuzzy_label_reaches_a_near_spelling(self):
+        # "Oleum" alone is contained in "OLEUM 65%" — the fuzzy_name_candidates
+        # containment rule, same one sheet-name routing already relies on.
+        result = self._filter("Two Tables", region="Oleum")
+        assert result["region_used"]["index"] == 1
+        assert result["region_used"]["label"] == "OLEUM 65%"
+
+    def test_label_matching_nothing_errors_listing_available_regions(self):
+        with pytest.raises(ValueError, match="matches no region body or label"):
+            self._filter("Two Tables", region="Sulphuric Acid")
+
+    def test_ambiguous_label_errors_rather_than_guessing(self, monkeypatch):
+        # Two regions sharing a label is a caller-visible data problem, not
+        # something the resolver should silently pick a winner for.
+        graph = _region_graph()
+        regions = graph["workspaces"]["/ERP"]["files"]["stmt.xlsx"]["sheets"][
+            "Two Tables"
+        ]["regions"]
+        regions[1] = dict(regions[1], label="NAPHTHALENE")
+        monkeypatch.setattr(query_engine, "load_graph", lambda: graph)
+        with pytest.raises(ValueError, match="matches more than one region"):
+            asyncio.run(
+                query_engine.execute_filter_sheet(
+                    "stmt.xlsx", "Two Tables", {}, None, None, "/ERP", False,
+                    "naphthalene",
+                )
+            )
 
     def test_omitted_region_on_multi_region_sheet_requires_explicit_fallback(self):
         with pytest.raises(ValueError, match="Pass region=<index> or region='<body span>'"):
@@ -1070,7 +1107,9 @@ class TestRegionScoping:
             )
         )
         assert [r["AbsRow"] for r in result["rows"]] == list(range(7, 16))
-        assert result["region_used"] == {"index": 0, "body": "7:15", "row_count": 9}
+        assert result["region_used"] == {
+            "index": 0, "body": "7:15", "row_count": 9, "label": "NAPHTHALENE",
+        }
 
     def test_fetch_top_rows_requires_explicit_fallback_on_multi_region_without_scope(self):
         with pytest.raises(ValueError, match="Pass region=<index> or region='<body span>'"):
@@ -1108,7 +1147,9 @@ class TestRegionScoping:
             )
         )
         assert [r["AbsRow"] for r in result["rows"]] == list(range(20, 29))
-        assert result["region_used"] == {"index": 1, "body": "20:28", "row_count": 9}
+        assert result["region_used"] == {
+            "index": 1, "body": "20:28", "row_count": 9, "label": "OLEUM 65%",
+        }
 
     def test_aggregate_scoped_to_region_sums_only_that_table(self):
         result = asyncio.run(
@@ -1332,6 +1373,77 @@ class TestStructureDrift:
     def test_unscanned_sheet_cannot_drift(self):
         assert query_engine._drift_report(["A"], {}) is None
         assert query_engine._drift_report(["A"], None) is None
+
+    def test_matching_row_count_is_not_drift(self):
+        report = query_engine._drift_report(
+            ["Name", "Qty"],
+            {"columns": ["Name", "Qty"], "row_count": 20},
+            live_row_count=20,
+        )
+        assert report is None
+
+    def test_row_count_drift_is_detected_even_when_header_matches(self):
+        # An appended row inside a table body never touches the header at
+        # all — header-only drift detection was blind to exactly this case.
+        report = query_engine._drift_report(
+            ["Name", "Qty"],
+            {"columns": ["Name", "Qty"], "row_count": 20},
+            live_row_count=25,
+        )
+        assert report["structure_drift"] is True
+        assert "stored_header" not in report
+        assert report["stored_row_count"] == 20
+        assert report["live_row_count"] == 25
+
+    def test_row_count_drift_on_a_region_sheet_warns_about_regions(self):
+        report = query_engine._drift_report(
+            ["Name", "Qty"],
+            {
+                "columns": ["Name", "Qty"],
+                "row_count": 20,
+                "regions": [{"body": "3:10"}],
+            },
+            live_row_count=25,
+        )
+        assert "region_drift_risk" in report
+
+    def test_row_count_drift_without_regions_has_no_region_warning(self):
+        report = query_engine._drift_report(
+            ["Name", "Qty"],
+            {"columns": ["Name", "Qty"], "row_count": 20},
+            live_row_count=25,
+        )
+        assert "region_drift_risk" not in report
+
+    def test_missing_stored_row_count_is_not_treated_as_drift(self):
+        # A pre-existing graph.json without a row_count field (or a sheet
+        # whose row_count was never recorded) must not manufacture drift.
+        report = query_engine._drift_report(
+            ["Name", "Qty"], {"columns": ["Name", "Qty"]}, live_row_count=25
+        )
+        assert report is None
+
+    def test_fetch_detects_row_count_drift_on_a_region_sheet(self, monkeypatch):
+        async def fake_used_range(item_id, sheet_name, *args, **kwargs):
+            return {"values": [["Name", "Qty"], ["a", 1], ["b", 2], ["c", 3]]}
+
+        monkeypatch.setattr(query_engine, "get_used_range", fake_used_range)
+        df, drift = asyncio.run(
+            query_engine._fetch_sheet_data(
+                "i",
+                "S",
+                {
+                    "header_row": 1,
+                    "columns": ["Name", "Qty"],
+                    "row_count": 2,
+                    "regions": [{"body": "2:2"}],
+                },
+            )
+        )
+        assert drift["structure_drift"] is True
+        assert drift["stored_row_count"] == 2
+        assert drift["live_row_count"] == 4
+        assert "region_drift_risk" in drift
 
     def test_fetch_flags_drift_but_still_answers(self, monkeypatch):
         async def fake_used_range(item_id, sheet_name, *args, **kwargs):

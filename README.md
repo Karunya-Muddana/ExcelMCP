@@ -289,9 +289,14 @@ used-range address) purely to detect drift, and — new in 0.3.0 — a **region
 map**: the row spans of each table body on a sheet, derived from the ranges the
 sheet's own `SUM`/`COUNT`/`AVERAGE` formulas refer to, plus the addresses any
 cross-sheet formula reads. Those are row numbers and cell addresses, not
-contents; no value is read to produce them. If any of this is more than you
-want on disk, don't scan that folder; if you want to verify the boundary,
-`graph.json` is small and readable, so go look.
+contents; no value is read to produce them. A region's `label`, where present,
+is the second deliberate exception alongside sampled values: a few words read
+from the section-banner cell immediately above a region (`"NAPHTHALENE"`,
+`"OLEUM 65%"`), kept so the model can name which table it means instead of
+guessing from row numbers. It is structural metadata describing the sheet's
+layout, not row data — the same distinction sampled values already draw. If
+any of this is more than you want on disk, don't scan that folder; if you want
+to verify the boundary, `graph.json` is small and readable, so go look.
 
 On Windows, `os.chmod` only toggles the read-only bit, so the `0600` mode is a best effort there and the real protection is the default per-user ACL on `%USERPROFILE%`. On macOS and Linux the mode is applied to the temp file before any content is written to it, so the token never briefly exists as world readable.
 

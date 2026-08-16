@@ -133,17 +133,56 @@ sheet holding more than one table body. On one of these
 sheets, filter_sheet, aggregate and derive all REQUIRE
 region: omitting it RAISES, naming the available regions,
 rather than silently summing or netting blocks that were
-never meant to be combined. Call sheet_layout first when
-unsure which table answers the question — it lists every
-region's body span, row count, and confidence without
-fetching data. fetch_region_rows fetches one exact region's
-raw rows (also refuses to fall back to the whole sheet);
-fetch_sheet_rows does the same but accepts
-allow_full_sheet_fallback=true for a deliberate whole-sheet
-read. filter_sheet, aggregate and derive accept that same
-allow_full_sheet_fallback=true escape hatch — use it only
-for an explicit, clearly-labeled whole-sheet result, never
-as a default.
+never meant to be combined. Each region may carry a label
+scanned from its own section banner ("NAPHTHALENE",
+"OLEUM 65%") — when present it is named right in that
+error, so pick the region by what it is called, not by
+guessing from index and row numbers. Call sheet_layout
+first when unsure which table answers the question — it
+lists every region's body span, label, row count, and
+confidence without fetching data. fetch_region_rows
+fetches one exact region's raw rows (also refuses to fall
+back to the whole sheet); fetch_sheet_rows does the same
+but accepts allow_full_sheet_fallback=true for a
+deliberate whole-sheet read. filter_sheet, aggregate and
+derive accept that same allow_full_sheet_fallback=true
+escape hatch — use it only for an explicit, clearly-
+labeled whole-sheet result, never as a default.
+A region's header_row is now scored against its own data,
+not just assumed to sit one row above its body — so it can
+land ABOVE the formula-derived body start when a row like
+an Opening Balance sits between them. That row (and any
+others the header names but the region's own totals never
+summed) shows up as the region's pre_body span. When you
+pass region to derive, its pre_body rows join the frame
+alongside the body — but only a components entry whose
+conditions actually match one (e.g. a blank transaction-type
+cell) picks it up; without that entry the row sits in the
+frame unmatched and contributes nothing, same as before. Add
+a components entry with sign 1 or base:true for the opening
+balance and its value joins the net; a stock figure derived
+from a scoped region without one is a stock figure missing
+its opening balance. filter_sheet and aggregate never widen
+the frame this way: their region continues to mean exactly
+the summed body, nothing more.
+region ALSO ACCEPTS A LABEL STRING directly — region=
+"naphthalene" resolves the same as region=0 when a region's
+scanned label plausibly means that (case/whitespace folded,
+then the same fuzzy match sheet-name routing already uses:
+containment, small typos). If that matches more than one
+region it RAISES rather than picking one; disambiguate with
+the index instead. Prefer this over memorising index numbers
+when the label is the identifying information you actually have.
+CACHED REGIONS CAN GO STALE. A structure_drift block in any
+response means the sheet was edited since the last scan.
+Region bodies are derived from the sheet's own formulas at
+scan time, and an edit that inserts or removes rows inside a
+table body never touches the header — so it is invisible to
+plain header-drift checking. When structure_drift also
+carries region_drift_risk, the sheet's live row count no
+longer matches what was scanned, and region boundaries here
+may be wrong: say so rather than trusting them, and suggest
+scan_workspace before reporting a number from that region.
 """,
 )
 
@@ -282,8 +321,11 @@ Also returns:
 - multi_region_sheets: sheets holding more than one table
   body. Each such sheet also keeps its `regions` list (the
   table bodies in absolute sheet rows, derived from the
-  sheet's own SUM/COUNT formulas), its `unclaimed_rows`,
-  and layout_confidence, which reads "unconfirmed" wherever
+  sheet's own SUM/COUNT formulas, each with a `label` when
+  its own section banner named it — pass that to `region`
+  by index or body span, but read the label to know which
+  table you are picking), its `unclaimed_rows`, and
+  layout_confidence, which reads "unconfirmed" wherever
   the region map came from formulas alone and nothing has
   verified it. A plain aggregate over one of these adds up
   blocks that were never meant to be summed — pick the
@@ -525,21 +567,29 @@ At most {MAX_ROWS_RETURNED} rows are returned; check the
 truncated and total_matched fields in the response.
 
 region SCOPES TO ONE TABLE on a multi-region sheet (see
-multi_region_sheets / RULE 13). Pass either the region's
-index (0, 1, ...) or its body span as it appears in
-get_workspace_graph's regions list ("7:28"). Applied
-before conditions. Omit it on a single-region sheet — no
-effect there.
+multi_region_sheets / RULE 13). Pass the region's index
+(0, 1, ...), its body span as it appears in
+get_workspace_graph's regions list ("7:28"), or a label
+string ("naphthalene") fuzzy-matched against each region's
+scanned section-banner label — ambiguous label matches
+raise rather than guess. Applied before conditions. Omit it
+on a single-region sheet — no effect there.
 On a multi-region sheet, region is EFFECTIVELY REQUIRED:
-omitting it RAISES, naming every region and its span,
-rather than silently flattening several tables into one
-result. Set allow_full_sheet_fallback=true only for a
-deliberate, explicitly-labeled whole-sheet read — then the
-call succeeds and the response carries region_warning
-instead of raising. An index out of range or a span
-matching no region is always an error listing the real
-regions, never a silent fallback. The region actually used
-comes back as region_used: {{index, body, row_count}} — cite it.
+omitting it RAISES, naming every region — by its label
+("NAPHTHALENE") when the sheet's own section banner gave it
+one, else its span — rather than silently flattening
+several tables into one result. Set
+allow_full_sheet_fallback=true only for a deliberate,
+explicitly-labeled whole-sheet read — then the call
+succeeds and the response carries region_warning instead of
+raising. An index out of range or a span matching no region
+is always an error listing the real regions, never a silent
+fallback. The region actually used comes back as
+region_used: {{index, body, row_count, label if any}} — cite it.
+filter_sheet's rows never include a region's pre_body rows
+(an opening balance the region's own formulas never
+summed) — only derive folds those in, and only when scoped
+to a region.
 """
 )
 async def filter_sheet(
@@ -636,9 +686,14 @@ async def fetch_sheet_rows(
 @mcp.tool(
     description="""
 Returns the sheet layout summary: header row, columns, used range, and each
-region's body span, row count, source, and confidence. Use this to decide
-whether a sheet is one table or several subtables before fetching rows or
-aggregating. This tool is factual metadata about the workbook, not a guess.
+region's label (when its own section banner named it), body span, header_row,
+formula_header_row (the raw formula-derived guess before scoring corrected
+it, kept for comparison), pre_body (rows the header names but the region's
+own formulas never totalled, such as an opening balance — empty when there
+is no gap between header and body), row count, source, and confidence. Use
+this to decide whether a sheet is one table or several subtables — and which
+one is which by name — before fetching rows or aggregating. This tool is
+factual metadata about the workbook, not a guess.
 """
 )
 async def sheet_layout(
@@ -719,14 +774,19 @@ Get column names from get_workspace_graph first.
 If the sheet appears in multi_region_sheets, the default
 behavior is strict: pass region (the region's index, e.g. 0,
 or its body span like "7:28" from get_workspace_graph's
-regions list) to restrict to the table you actually mean,
-applied before conditions and grouping; omitting it raises
-instead of silently flattening the sheet. The region
-actually used comes back as region_used: {index, body,
-row_count}. Returns rows plus a truncated flag. If conditions
-matched zero rows, zero_match_diagnostics shows what
-each condition matched alone and the values actually
-present — correct the condition and retry.
+regions list — or sheet_layout to see each region's label)
+to restrict to the table you actually mean, applied before
+conditions and grouping; omitting it raises instead of
+silently flattening the sheet, naming each region by its
+label when the sheet's own section banner gave it one. The
+region actually used comes back as region_used: {index,
+body, row_count, label if any}. Like filter_sheet, the
+summed rows never include a region's pre_body (an opening
+balance the region's own formulas never totalled) — only
+derive folds those in. Returns rows plus a truncated flag.
+If conditions matched zero rows, zero_match_diagnostics
+shows what each condition matched alone and the values
+actually present — correct the condition and retry.
 """
 )
 async def aggregate(
@@ -952,17 +1012,31 @@ only when you actually want the net broken out per group.
 
 region SCOPES TO ONE TABLE on a multi-region sheet — see
 filter_sheet's region parameter for the full contract
-(index or body span, applied before conditions and
-components). On a multi-region sheet region is EFFECTIVELY
-REQUIRED: omitting it RAISES, naming every region and its
-span, rather than silently netting several tables together.
-Set allow_full_sheet_fallback=true only for a deliberate,
-explicitly-labeled whole-sheet net — the response then
-carries region_warning instead of raising. The region
-actually used comes back as region_used: {index, body,
-row_count}. This is what turns "receipts minus returns
-across the whole sheet" into "net for Naphthalene" instead
-of Naphthalene and Oleum netted together.
+(index or body span, or sheet_layout to see each region's
+label; applied before conditions and components). On a
+multi-region sheet region is EFFECTIVELY REQUIRED: omitting
+it RAISES, naming every region by its label when the sheet's
+own section banner gave it one, rather than silently netting
+several tables together. Set allow_full_sheet_fallback=true
+only for a deliberate, explicitly-labeled whole-sheet net —
+the response then carries region_warning instead of raising.
+The region actually used comes back as region_used: {index,
+body, row_count, label if any}. This is what turns "receipts
+minus returns across the whole sheet" into "net for
+Naphthalene" instead of Naphthalene and Oleum netted
+together.
+
+UNLIKE filter_sheet/aggregate, a resolved region's pre_body
+rows (an opening balance the region's own formulas never
+summed — see sheet_layout) join the frame here too, so a
+components entry that matches one (blank transaction-type,
+"sign": 1 or "base": true) folds it into the net. This is
+what makes derive(region=0, components=[...,
+{"conditions": {"Type": {"is_null": true}}, "base": true,
+"label": "opening"}]) return the correct stock figure
+instead of receipts-minus-returns with the opening balance
+quietly missing. region_used carries pre_body: "<span>" when
+this happened.
 """
 )
 async def derive(

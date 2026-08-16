@@ -15,7 +15,7 @@ from excelmcp.graph_client import (
     list_excel_files,
 )
 from excelmcp.ranges import build_range, parse_range
-from excelmcp.regions import derive_sheet_regions, extract_sheet_references
+from excelmcp.regions import derive_sheet_regions, extract_sheet_references, unclaimed_rows
 from excelmcp.storage import atomic_write_text, get_config_dir, log, read_json
 
 
@@ -682,6 +682,92 @@ _HEADER_WINDOW_ROWS = 10
 _SCAN_WINDOW_COLS = 52
 
 
+async def _resolve_region_header(
+    item_id: str,
+    sheet_name: str,
+    session_id: Any,
+    col1: int,
+    col2: int,
+    row1: int,
+    row2: int,
+    formula_header: Optional[int],
+) -> tuple[Optional[int], float, str, int, list[list[Any]]]:
+    """Scores candidate header rows near one region's formula-derived guess.
+
+    ``build_regions`` sets a region's ``header_row`` to ``body_start - 1``,
+    which is exact when the header sits directly above the totalled block and
+    a row early whenever an Opening Balance line sits between them — the same
+    ambiguity :func:`resolve_header_row` already settles at sheet level. This
+    applies that scoring per region instead, since Tier 1 (``regions.py``)
+    only ever sees formulas, never cell values.
+
+    ``formula_header`` is body_start - 1 in absolute sheet rows (None when the
+    body starts at the very top of the used range, leaving no row above it to
+    score). Returns (resolved_absolute_row, score, confidence, block_row1,
+    block_values) — the block is returned too so label extraction can reuse
+    the same read instead of fetching the same few rows twice. A None
+    resolved row (or "unreliable" confidence) means nothing scored well
+    enough to trust; the caller keeps the formula-derived guess in that case.
+    """
+    if formula_header is None or formula_header < row1:
+        return None, 0.0, "unreliable", row1, []
+    block_row1 = max(row1, formula_header - 8)
+    block_address = build_range(
+        col1,
+        block_row1,
+        min(col2, col1 + _SCAN_WINDOW_COLS - 1),
+        min(row2, block_row1 + _HEADER_WINDOW_ROWS - 1),
+    )
+    block = await get_range(
+        item_id, sheet_name, block_address, session_id, select="values"
+    )
+    block_values = block.get("values") or []
+    if not block_values:
+        return None, 0.0, "unreliable", block_row1, []
+    candidate_idx = formula_header - block_row1
+    resolved_idx, score, confidence = resolve_header_row(
+        block_values, [candidate_idx] if candidate_idx >= 0 else None
+    )
+    return block_row1 + resolved_idx, score, confidence, block_row1, block_values
+
+
+# A region's own banner names it outright — 'SECTION: OLEUM 65%' above a
+# table body is the workbook author labelling the section, evidence of a
+# completely different quality from guessing at the region's contents.
+_SECTION_PREFIX_RE = re.compile(r"^section\s*:\s*", re.IGNORECASE)
+
+
+def _region_label_from_window(
+    block_row1: int,
+    block_values: list[list[Any]],
+    header_abs: int,
+    lower_bound: int,
+) -> Optional[str]:
+    """The nearest banner-shaped row strictly between lower_bound and header_abs.
+
+    A banner is a single populated cell standing alone — unlike a header row
+    (several columns) or a label/value pair like 'Opening Balance | 22000'.
+    Scanning upward from just above the header means the closest banner wins
+    over an outer one (a client name further up the sheet). An obvious
+    'SECTION:' prefix is stripped; the rest is kept verbatim, because
+    'OLEUM 65%' carries a grade that matters.
+
+    Returns None rather than inventing a label when nothing in the window
+    looks like a banner — a missing label costs a few extra tool calls; a
+    wrong one costs a wrong answer.
+    """
+    for row_idx in range(header_abs - 1, lower_bound, -1):
+        block_idx = row_idx - block_row1
+        if not (0 <= block_idx < len(block_values)):
+            continue
+        row = block_values[block_idx]
+        non_empty = [c for c in row if c is not None and str(c).strip()]
+        if len(non_empty) == 1:
+            text = " ".join(str(non_empty[0]).split())
+            return _SECTION_PREFIX_RE.sub("", text, count=1).strip()
+    return None
+
+
 async def _scan_sheet_structure(
     item_id: str, sheet_name: str, session_id: Any
 ) -> dict[str, Any] | None:
@@ -719,6 +805,65 @@ async def _scan_sheet_structure(
 
     regions, unclaimed = derive_sheet_regions(formulas, row1, row2)
     references = extract_sheet_references(formulas)
+
+    if regions:
+        # header_row is body_start - 1 until corrected below — the boundary
+        # a body's own formulas point to, not necessarily where its header
+        # actually sits (an Opening Balance line between them shifts it up
+        # one row). prev_ends tracks each region's lower search bound for
+        # label extraction: the previous region's body end, or row1 - 1 for
+        # the first region — computed from bodies alone, so it does not
+        # depend on the header correction happening in the same pass.
+        prev_ends: list[int] = []
+        prev_end = row1 - 1
+        for region in regions:
+            prev_ends.append(prev_end)
+            prev_end = int(region["body"].split(":")[1])
+
+        resolved_headers = await asyncio.gather(
+            *[
+                _resolve_region_header(
+                    item_id, sheet_name, session_id, col1, col2, row1, row2,
+                    region.get("header_row"),
+                )
+                for region in regions
+            ]
+        )
+        for region, prev_body_end, (
+            resolved_abs, header_row_score, header_row_confidence,
+            blk_row1, blk_values,
+        ) in zip(regions, prev_ends, resolved_headers):
+            formula_header = region.get("header_row")
+            new_header = (
+                resolved_abs
+                if resolved_abs is not None and header_row_confidence != "unreliable"
+                else formula_header
+            )
+            region["formula_header_row"] = formula_header
+            region["header_row"] = new_header
+            region["header_confidence"] = header_row_confidence
+            region["header_score"] = round(header_row_score, 3)
+            body_start, body_end = (int(x) for x in region["body"].split(":"))
+            region["range"] = (
+                f"{new_header if new_header is not None else body_start}:{body_end}"
+            )
+            if new_header is not None:
+                # Rows the header names but the region's own totals do not
+                # cover — an opening balance sitting between the header and
+                # the first numbered entry. Only exists when there is an
+                # actual gap; a header directly above its body has none.
+                if new_header + 1 <= body_start - 1:
+                    region["pre_body"] = f"{new_header + 1}:{body_start - 1}"
+                label = _region_label_from_window(
+                    blk_row1, blk_values, new_header, prev_body_end
+                )
+                if label:
+                    region["label"] = label
+
+        # Region ranges may have shifted (a corrected header sits above the
+        # formula's guess), so the unclaimed gaps between them must be
+        # recomputed rather than reused from derive_sheet_regions above.
+        unclaimed = unclaimed_rows(regions, row1, row2)
 
     window_address = build_range(
         col1,

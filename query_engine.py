@@ -99,28 +99,63 @@ def _convert_date_columns(
 
 
 def _drift_report(
-    live_headers: list[str], sheet_info: Optional[dict[str, Any]]
+    live_headers: list[str],
+    sheet_info: Optional[dict[str, Any]],
+    live_row_count: Optional[int] = None,
 ) -> Optional[dict[str, Any]]:
-    """Compares the freshly read header row against the scan-time fingerprint.
+    """Compares the freshly read header row and row count against the
+    scan-time fingerprint.
 
     graph.json stores header_row from scan time; a row inserted above the
     header in OneDrive shifts the used range and the cached index then points
     at a data row. The mismatch is only loud when it produces garbage column
     names — this makes it loud always.
+
+    Header drift alone misses the far more common edit on a multi-region
+    sheet: rows appended or removed *inside* a table body, which never
+    touches the header at all but leaves every cached region body span (and
+    any label banner below it) one edit away from wrong. live_row_count —
+    already read for the actual query, so this costs no extra Graph call —
+    catches that case by comparing against the row count recorded at scan
+    time.
     """
-    stored = (sheet_info or {}).get("columns")
-    if not stored or live_headers == stored:
+    sheet_info = sheet_info or {}
+    stored_headers = sheet_info.get("columns")
+    header_changed = bool(stored_headers) and live_headers != stored_headers
+
+    stored_row_count = sheet_info.get("row_count")
+    row_count_changed = (
+        live_row_count is not None
+        and stored_row_count is not None
+        and live_row_count != stored_row_count
+    )
+
+    if not header_changed and not row_count_changed:
         return None
-    return {
-        "structure_drift": True,
-        "stored_header": stored,
-        "live_header": live_headers,
-        "recommendation": (
-            "The sheet's header row no longer matches the structure captured "
-            "at scan time — the sheet was probably edited. Results below use "
-            "the live header, but run scan_workspace to refresh the index."
-        ),
-    }
+
+    report: dict[str, Any] = {"structure_drift": True}
+    if header_changed:
+        report["stored_header"] = stored_headers
+        report["live_header"] = live_headers
+    if row_count_changed:
+        report["stored_row_count"] = stored_row_count
+        report["live_row_count"] = live_row_count
+        if sheet_info.get("regions"):
+            report["region_drift_risk"] = (
+                "This sheet's used range now has a different row count than "
+                "at scan time, but its regions (table bodies, headers, "
+                "labels) are cached from that same scan. Rows were likely "
+                "inserted or removed inside a table body without moving the "
+                "header, so region body spans below the edit may now be "
+                "wrong. Treat region boundaries here as unconfirmed until "
+                "scan_workspace refreshes them."
+            )
+    report["recommendation"] = (
+        "The sheet's structure no longer matches what was captured at scan "
+        "time — the sheet was probably edited. Results below use the live "
+        "header, but run scan_workspace to refresh the index."
+    )
+    return report
 
 
 async def _fetch_sheet_data(
@@ -145,7 +180,7 @@ async def _fetch_sheet_data(
     # Same normalisation as scan-time discovery, so the frame's column names
     # always match what get_workspace_graph told the agent.
     headers = columns_from_row(values[header_idx])
-    drift = _drift_report(headers, sheet_info)
+    drift = _drift_report(headers, sheet_info, live_row_count=len(values))
 
     data_rows = values[header_idx + 1:]
     padded: list[list[Any]] = []
@@ -413,7 +448,57 @@ def _resolve_sheet(
 
 
 def _region_summary(index: int, region: dict[str, Any]) -> dict[str, Any]:
-    return {"index": index, "body": region.get("body"), "header_row": region.get("header_row")}
+    summary = {
+        "index": index,
+        "body": region.get("body"),
+        "header_row": region.get("header_row"),
+    }
+    if region.get("label"):
+        summary["label"] = region["label"]
+    return summary
+
+
+def _region_span_text(index: int, region: dict[str, Any]) -> str:
+    """'0: NAPHTHALENE, rows 7:28' when the region has a label scanned from a
+    section banner, else the bare '0: 7:28' — the difference between the
+    model guessing which table answers a question and the model knowing."""
+    label = region.get("label")
+    body = region.get("body")
+    return f"{index}: {label}, rows {body}" if label else f"{index}: {body}"
+
+
+_SPAN_TEXT_RE = re.compile(r"^\s*\d+\s*:\s*\d+\s*$")
+
+
+def _match_region_by_label(
+    regions: list[dict[str, Any]], query: str
+) -> tuple[Optional[tuple[int, dict[str, Any]]], list[dict[str, Any]]]:
+    """Fuzzy-matches `query` against each region's scanned label.
+
+    Returns (match, ambiguous_candidates). `match` is set only when exactly
+    one region's label plausibly means `query` — an exact case/whitespace-
+    insensitive match wins outright; otherwise the same fuzzy logic already
+    used for sheet-name drift (containment, small typos, via
+    fuzzy_name_candidates) decides. More than one plausible region is
+    ambiguity to report, not a guess to make silently, so it comes back in
+    `ambiguous_candidates` instead of being resolved.
+    """
+    labelled = [(i, r) for i, r in enumerate(regions) if r.get("label")]
+    if not labelled:
+        return None, []
+    query_n = normalise_name(query)
+    exact = [(i, r) for i, r in labelled if normalise_name(r["label"]) == query_n]
+    if len(exact) == 1:
+        return exact[0], []
+    if len(exact) > 1:
+        return None, [r for _, r in exact]
+    candidates = set(fuzzy_name_candidates(query, [r["label"] for _, r in labelled]))
+    fuzzy_matches = [(i, r) for i, r in labelled if r["label"] in candidates]
+    if len(fuzzy_matches) == 1:
+        return fuzzy_matches[0], []
+    if len(fuzzy_matches) > 1:
+        return None, [r for _, r in fuzzy_matches]
+    return None, []
 
 
 def _resolve_region(
@@ -421,19 +506,22 @@ def _resolve_region(
 ) -> Optional[tuple[int, dict[str, Any]]]:
     """Resolves `region` to (index, region_entry) in sheet_info['regions'].
 
-    `region` is either an integer index or a 'first:last' absolute-row span
-    matching a region's body. None (the default) resolves to None — no
-    scoping. An index out of range or a span matching nothing is a caller
-    mistake, not a request to fall back to the whole sheet, so both raise
-    with the available regions listed rather than silently ignoring `region`.
+    `region` is an integer index, a 'first:last' absolute-row span matching a
+    region's body, or a label string fuzzy-matched against each region's
+    scanned section-banner label ("naphthalene" reaches "NAPHTHALENE"). None
+    (the default) resolves to None — no scoping. An index out of range, a
+    span matching nothing, a label matching nothing, or a label matching more
+    than one region is a caller mistake, not a request to fall back to the
+    whole sheet, so all of these raise with the available regions listed
+    rather than silently ignoring `region` or guessing among candidates.
     """
     if region is None:
         return None
     regions = sheet_info.get("regions") or []
     if isinstance(region, bool):
         raise ValueError(
-            f"region must be an integer index or a 'first:last' span string, "
-            f"got {region!r}."
+            f"region must be an integer index, a 'first:last' span string, "
+            f"or a region label, got {region!r}."
         )
     if isinstance(region, int):
         if 0 <= region < len(regions):
@@ -444,19 +532,37 @@ def _resolve_region(
             f"{[_region_summary(i, r) for i, r in enumerate(regions)]}"
         )
     if isinstance(region, str):
-        wanted = parse_span(region)
-        for i, r in enumerate(regions):
-            body = r.get("body")
-            if body and parse_span(body) == wanted:
-                return i, r
+        text = region.strip()
+        if _SPAN_TEXT_RE.match(text):
+            wanted = parse_span(text)
+            for i, r in enumerate(regions):
+                body = r.get("body")
+                if body and parse_span(body) == wanted:
+                    return i, r
+            raise ValueError(
+                f"region '{region}' matches no region body on '{file_name}'/"
+                f"'{sheet_name}'. Available regions: "
+                f"{[_region_summary(i, r) for i, r in enumerate(regions)]}"
+            )
+        match, ambiguous = _match_region_by_label(regions, text)
+        if match:
+            return match
+        if ambiguous:
+            raise ValueError(
+                f"region label '{region}' matches more than one region on "
+                f"'{file_name}'/'{sheet_name}': "
+                f"{[r.get('label') for r in ambiguous]}. Use the region "
+                f"index instead. Available regions: "
+                f"{[_region_summary(i, r) for i, r in enumerate(regions)]}"
+            )
         raise ValueError(
-            f"region '{region}' matches no region body on '{file_name}'/"
-            f"'{sheet_name}'. Available regions: "
+            f"region '{region}' matches no region body or label on "
+            f"'{file_name}'/'{sheet_name}'. Available regions: "
             f"{[_region_summary(i, r) for i, r in enumerate(regions)]}"
         )
     raise ValueError(
-        f"region must be an integer index or a 'first:last' span string, "
-        f"got {region!r}."
+        f"region must be an integer index, a 'first:last' span string, or a "
+        f"region label, got {region!r}."
     )
 
 
@@ -480,7 +586,9 @@ def _scope_to_region(
     resolved = _resolve_region(sheet_info, region, file_name, sheet_name)
     if resolved is None:
         if len(regions) > 1:
-            spans = ", ".join(f"{i}: {r.get('body')}" for i, r in enumerate(regions))
+            spans = "; ".join(
+                _region_span_text(i, r) for i, r in enumerate(regions)
+            )
             if not allow_full_sheet_fallback:
                 raise ValueError(
                     f"'{sheet_name}' in '{file_name}' holds {len(regions)} table "
@@ -510,8 +618,68 @@ def _scope_to_region(
     start = max(start, 0)
     stop = max(min(stop, len(df)), start)
     scoped = df.iloc[start:stop].copy()
-    region_used = {"index": index, "body": entry.get("body"), "row_count": len(scoped)}
+    region_used: dict[str, Any] = {
+        "index": index,
+        "body": entry.get("body"),
+        "row_count": len(scoped),
+    }
+    if entry.get("label"):
+        region_used["label"] = entry["label"]
     return scoped, region_used, None
+
+
+def _scope_to_region_for_derive(
+    df: pd.DataFrame,
+    sheet_info: dict[str, Any],
+    region: Any,
+    file_name: str,
+    sheet_name: str,
+    *,
+    allow_full_sheet_fallback: bool = False,
+) -> tuple[pd.DataFrame, Optional[dict[str, Any]], Optional[str]]:
+    """Like `_scope_to_region`, but a resolved region also pulls in its
+    `pre_body` rows — an opening balance sitting between the header and the
+    body, which the region's own formulas never totalled and body-only
+    scoping therefore excludes by construction.
+
+    Only `derive` calls this. `filter_sheet` and `aggregate` keep calling
+    `_scope_to_region` unchanged: a raw row dump or a sum of the body has no
+    business including a row the sheet itself never summed, and widening
+    their frame silently would make a total that used to exclude that row
+    start including it without anyone asking.
+    """
+    scoped, region_used, region_warning = _scope_to_region(
+        df,
+        sheet_info,
+        region,
+        file_name,
+        sheet_name,
+        allow_full_sheet_fallback=allow_full_sheet_fallback,
+    )
+    if region_used is None:
+        return scoped, region_used, region_warning
+
+    regions = sheet_info.get("regions") or []
+    index = region_used.get("index")
+    entry = regions[index] if isinstance(index, int) and 0 <= index < len(regions) else None
+    pre_body = entry.get("pre_body") if entry else None
+    if not pre_body:
+        return scoped, region_used, region_warning
+
+    used_range_address = sheet_info.get("used_range_address")
+    header_row = sheet_info.get("header_row", 1)
+    start, stop = region_to_df_slice(used_range_address, header_row, pre_body)
+    start = max(start, 0)
+    stop = max(min(stop, len(df)), start)
+    pre_body_df = df.iloc[start:stop]
+    if pre_body_df.empty:
+        return scoped, region_used, region_warning
+
+    widened = pd.concat([pre_body_df, scoped], ignore_index=True)
+    region_used = dict(region_used)
+    region_used["pre_body"] = pre_body
+    region_used["row_count"] = len(widened)
+    return widened, region_used, region_warning
 
 
 def _clamp_limit(limit: Optional[int]) -> int:
@@ -764,17 +932,21 @@ async def execute_sheet_layout(
                 row_count = stop - start
             except (TypeError, ValueError):
                 row_count = 0
-        region_entries.append(
-            {
-                "index": index,
-                "body": body,
-                "header_row": entry.get("header_row"),
-                "range": entry.get("range"),
-                "source": entry.get("source"),
-                "confidence": entry.get("confidence"),
-                "row_count": row_count,
-            }
-        )
+        region_info: dict[str, Any] = {
+            "index": index,
+            "body": body,
+            "header_row": entry.get("header_row"),
+            "formula_header_row": entry.get("formula_header_row"),
+            "range": entry.get("range"),
+            "source": entry.get("source"),
+            "confidence": entry.get("confidence"),
+            "row_count": row_count,
+        }
+        if entry.get("pre_body"):
+            region_info["pre_body"] = entry["pre_body"]
+        if entry.get("label"):
+            region_info["label"] = entry["label"]
+        region_entries.append(region_info)
 
     result = {
         "file": file_name,
@@ -1410,7 +1582,7 @@ async def execute_derive(
     df, drift = await _fetch_sheet_data(
         file_info["item_id"], sheet_name, sheet_info
     )
-    df, region_used, region_warning = _scope_to_region(
+    df, region_used, region_warning = _scope_to_region_for_derive(
         df,
         sheet_info,
         region,
