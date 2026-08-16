@@ -1136,6 +1136,41 @@ class TestRegionScoping:
         assert result["rows"] == [{"net": -11.0}]
         assert result["region_used"]["body"] == "7:15"
 
+    def test_derive_omitted_region_on_multi_region_sheet_raises(self):
+        # derive shares _scope_to_region with filter_sheet/aggregate, so it
+        # must refuse to net multiple tables together by default too — this
+        # was left un-wired when allow_full_sheet_fallback was added.
+        with pytest.raises(
+            ValueError, match="Pass region=<index> or region='<body span>'"
+        ):
+            asyncio.run(
+                query_engine.execute_derive(
+                    "/ERP", "stmt.xlsx", "Two Tables", None, "Qty",
+                    [
+                        {"conditions": {"Type": "Receipt"}, "sign": 1, "label": "receipts"},
+                        {"conditions": {"Type": "Return"}, "sign": -1, "label": "returns"},
+                    ],
+                )
+            )
+
+    def test_derive_can_opt_into_full_sheet_fallback(self):
+        # Unscoped, all 25 rows (abs 6..30): Receipt on even rows sums to
+        # 234, Return on odd rows sums to 216 -> net 18.
+        result = asyncio.run(
+            query_engine.execute_derive(
+                "/ERP", "stmt.xlsx", "Two Tables", None, "Qty",
+                [
+                    {"conditions": {"Type": "Receipt"}, "sign": 1, "label": "receipts"},
+                    {"conditions": {"Type": "Return"}, "sign": -1, "label": "returns"},
+                ],
+                None, None,
+                allow_full_sheet_fallback=True,
+            )
+        )
+        assert "region_used" not in result
+        assert "2 table" in result["region_warning"]
+        assert result["rows"] == [{"net": 18.0}]
+
 
 # --------------------------------------------------- structured conditions
 

@@ -1352,6 +1352,8 @@ async def execute_derive(
     components: Optional[list[dict[str, Any]]] = None,
     conditions: Optional[dict[str, Any]] = None,
     region: Any = None,
+    *,
+    allow_full_sheet_fallback: bool = False,
 ) -> dict:
     """Signed sum over transaction types: the five-call stock calculation in one.
 
@@ -1369,6 +1371,11 @@ async def execute_derive(
 
     group_by is optional: omit it to get one net total over every matching
     row instead of one row per group.
+
+    On a multi-region sheet, region is effectively required: omitting it
+    raises (naming the available regions) rather than silently netting
+    several tables together. allow_full_sheet_fallback=True opts into the
+    old warn-and-continue behaviour instead, matching filter_sheet/aggregate.
     """
     folder_path = folder_path.rstrip("/")
     if not isinstance(components, list) or not components:
@@ -1404,7 +1411,12 @@ async def execute_derive(
         file_info["item_id"], sheet_name, sheet_info
     )
     df, region_used, region_warning = _scope_to_region(
-        df, sheet_info, region, file_name, sheet_name
+        df,
+        sheet_info,
+        region,
+        file_name,
+        sheet_name,
+        allow_full_sheet_fallback=allow_full_sheet_fallback,
     )
 
     if quantity_col not in df.columns:

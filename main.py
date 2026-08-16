@@ -129,11 +129,21 @@ where the number came from.
 
 RULE 13 — A SHEET WITH SEVERAL REGIONS IS SEVERAL TABLES
 multi_region_sheets in get_workspace_graph lists every
-sheet holding more than one table body. Aggregating one
-of those without restricting to the region you mean adds
-up blocks that were never meant to be summed. Read its
-regions and unclaimed_rows, decide which table answers
-the question, and say which one you used.
+sheet holding more than one table body. On one of these
+sheets, filter_sheet, aggregate and derive all REQUIRE
+region: omitting it RAISES, naming the available regions,
+rather than silently summing or netting blocks that were
+never meant to be combined. Call sheet_layout first when
+unsure which table answers the question — it lists every
+region's body span, row count, and confidence without
+fetching data. fetch_region_rows fetches one exact region's
+raw rows (also refuses to fall back to the whole sheet);
+fetch_sheet_rows does the same but accepts
+allow_full_sheet_fallback=true for a deliberate whole-sheet
+read. filter_sheet, aggregate and derive accept that same
+allow_full_sheet_fallback=true escape hatch — use it only
+for an explicit, clearly-labeled whole-sheet result, never
+as a default.
 """,
 )
 
@@ -519,13 +529,17 @@ multi_region_sheets / RULE 13). Pass either the region's
 index (0, 1, ...) or its body span as it appears in
 get_workspace_graph's regions list ("7:28"). Applied
 before conditions. Omit it on a single-region sheet — no
-effect there. Omit it on a multi-region sheet and the
-response carries region_warning naming every region and
-its span, because the result then spans all of them. An
-index out of range or a span matching no region is an
-error listing the real regions, never a silent fallback
-to the whole sheet. The region actually used comes back
-as region_used: {{index, body, row_count}} — cite it.
+effect there.
+On a multi-region sheet, region is EFFECTIVELY REQUIRED:
+omitting it RAISES, naming every region and its span,
+rather than silently flattening several tables into one
+result. Set allow_full_sheet_fallback=true only for a
+deliberate, explicitly-labeled whole-sheet read — then the
+call succeeds and the response carries region_warning
+instead of raising. An index out of range or a span
+matching no region is always an error listing the real
+regions, never a silent fallback. The region actually used
+comes back as region_used: {{index, body, row_count}} — cite it.
 """
 )
 async def filter_sheet(
@@ -939,10 +953,16 @@ only when you actually want the net broken out per group.
 region SCOPES TO ONE TABLE on a multi-region sheet — see
 filter_sheet's region parameter for the full contract
 (index or body span, applied before conditions and
-components, region_used/region_warning in the response).
-This is what turns "receipts minus returns across the
-whole sheet" into "net for Naphthalene" instead of
-Naphthalene and Oleum stacked together.
+components). On a multi-region sheet region is EFFECTIVELY
+REQUIRED: omitting it RAISES, naming every region and its
+span, rather than silently netting several tables together.
+Set allow_full_sheet_fallback=true only for a deliberate,
+explicitly-labeled whole-sheet net — the response then
+carries region_warning instead of raising. The region
+actually used comes back as region_used: {index, body,
+row_count}. This is what turns "receipts minus returns
+across the whole sheet" into "net for Naphthalene" instead
+of Naphthalene and Oleum netted together.
 """
 )
 async def derive(
@@ -954,11 +974,12 @@ async def derive(
     folder_path: Optional[str] = None,
     conditions: Optional[dict] = None,
     region: Optional[Any] = None,
+    allow_full_sheet_fallback: bool = False,
 ) -> dict:
     folder = _resolve_folder(folder_path)
     result = await execute_derive(
         folder, file_name, sheet, group_by, quantity_col, components, conditions,
-        region,
+        region, allow_full_sheet_fallback=allow_full_sheet_fallback,
     )
     data = {
         "rows": result["rows"],
