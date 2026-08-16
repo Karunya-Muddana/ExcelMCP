@@ -4,9 +4,9 @@ from typing import Any, Optional
 
 from fastmcp import FastMCP
 
-from embeddings import update_embeddings
-from lookup import execute_get_cell, execute_lookup
-from query_engine import (
+from excelmcp.embeddings import update_embeddings
+from excelmcp.lookup import execute_get_cell, execute_lookup
+from excelmcp.query_engine import (
     MAX_ROWS_RETURNED,
     execute_aggregate,
     execute_cross_file_aggregate,
@@ -16,7 +16,7 @@ from query_engine import (
     execute_join_sheets,
     execute_query,
 )
-from structure import (
+from excelmcp.structure import (
     discover_structure,
     load_graph,
     sheet_name_variants,
