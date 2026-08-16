@@ -1041,8 +1041,17 @@ class TestRegionScoping:
         with pytest.raises(ValueError, match="matches no region"):
             self._filter("Two Tables", region="100:200")
 
-    def test_omitted_region_on_multi_region_sheet_warns_and_sees_everything(self):
-        result = self._filter("Two Tables")
+    def test_omitted_region_on_multi_region_sheet_requires_explicit_fallback(self):
+        with pytest.raises(ValueError, match="Pass region=<index> or region='<body span>'"):
+            self._filter("Two Tables")
+
+    def test_omitted_region_on_multi_region_sheet_can_opt_into_full_sheet_fallback(self):
+        result = asyncio.run(
+            query_engine.execute_filter_sheet(
+                "stmt.xlsx", "Two Tables", {}, None, None, "/ERP", False, None,
+                allow_full_sheet_fallback=True,
+            )
+        )
         assert "region_used" not in result
         assert "2 table" in result["region_warning"]
         assert "7:15" in result["region_warning"] and "20:28" in result["region_warning"]
@@ -1053,6 +1062,53 @@ class TestRegionScoping:
         assert "region_used" not in result
         assert "region_warning" not in result
         assert len(result["rows"]) == 10  # unscoped: rows 6..15
+
+    def test_fetch_top_rows_respects_region_scope(self):
+        result = asyncio.run(
+            query_engine.execute_fetch_sheet_rows(
+                "stmt.xlsx", "Two Tables", "/ERP", region=0, limit=500
+            )
+        )
+        assert [r["AbsRow"] for r in result["rows"]] == list(range(7, 16))
+        assert result["region_used"] == {"index": 0, "body": "7:15", "row_count": 9}
+
+    def test_fetch_top_rows_requires_explicit_fallback_on_multi_region_without_scope(self):
+        with pytest.raises(ValueError, match="Pass region=<index> or region='<body span>'"):
+            asyncio.run(
+                query_engine.execute_fetch_sheet_rows(
+                    "stmt.xlsx", "Two Tables", "/ERP", limit=500
+                )
+            )
+
+    def test_fetch_top_rows_can_opt_into_full_sheet_fallback(self):
+        result = asyncio.run(
+            query_engine.execute_fetch_sheet_rows(
+                "stmt.xlsx", "Two Tables", "/ERP", limit=500,
+                allow_full_sheet_fallback=True,
+            )
+        )
+        assert "region_warning" in result
+        assert "7:15" in result["region_warning"] and "20:28" in result["region_warning"]
+        assert [r["AbsRow"] for r in result["rows"]] == list(range(6, 31))
+
+    def test_sheet_layout_lists_each_region_and_counts(self):
+        result = asyncio.run(
+            query_engine.execute_sheet_layout("stmt.xlsx", "Two Tables", "/ERP")
+        )
+        assert result["region_count"] == 2
+        assert result["regions"][0]["body"] == "7:15"
+        assert result["regions"][0]["row_count"] == 9
+        assert result["regions"][1]["body"] == "20:28"
+        assert result["regions"][1]["row_count"] == 9
+
+    def test_fetch_region_rows_requires_exact_region_and_fetches_it(self):
+        result = asyncio.run(
+            query_engine.execute_fetch_region_rows(
+                "stmt.xlsx", "Two Tables", "/ERP", region=1, limit=None
+            )
+        )
+        assert [r["AbsRow"] for r in result["rows"]] == list(range(20, 29))
+        assert result["region_used"] == {"index": 1, "body": "20:28", "row_count": 9}
 
     def test_aggregate_scoped_to_region_sums_only_that_table(self):
         result = asyncio.run(

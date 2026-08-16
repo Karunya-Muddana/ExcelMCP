@@ -466,24 +466,34 @@ def _scope_to_region(
     region: Any,
     file_name: str,
     sheet_name: str,
+    *,
+    allow_full_sheet_fallback: bool = False,
 ) -> tuple[pd.DataFrame, Optional[dict[str, Any]], Optional[str]]:
-    """Slices `df` to one table region when asked; warns when it should have been.
+    """Slices `df` to one table region when asked.
 
-    Returns (scoped_df, region_used, region_warning). On a sheet with more
-    than one region and no `region` given, the frame is returned unscoped
-    (today's behaviour) but region_warning names how many regions exist and
-    their body spans, so a total that spans several tables is visibly one.
+    Default behavior is strict: multi-region sheets require an explicit region,
+    otherwise a ValueError is raised so the caller cannot silently flatten
+    multiple subtables together. When `allow_full_sheet_fallback=True`, the
+    caller intentionally opts into the warning-only whole-sheet read path.
     """
     regions = sheet_info.get("regions") or []
     resolved = _resolve_region(sheet_info, region, file_name, sheet_name)
     if resolved is None:
         if len(regions) > 1:
             spans = ", ".join(f"{i}: {r.get('body')}" for i, r in enumerate(regions))
+            if not allow_full_sheet_fallback:
+                raise ValueError(
+                    f"'{sheet_name}' in '{file_name}' holds {len(regions)} table "
+                    f"regions ({spans}) and no `region` was given. Pass "
+                    f"region=<index> or region='<body span>' to scope to one table; "
+                    f"otherwise set allow_full_sheet_fallback=True for an explicit "
+                    f"whole-sheet fallback."
+                )
             warning = (
                 f"'{sheet_name}' in '{file_name}' holds {len(regions)} table "
-                f"regions ({spans}) and no `region` was given — this result "
-                f"spans all of them. Pass region=<index> or region='<body span>' "
-                f"to scope to one table."
+                f"regions ({spans}) and a whole-sheet fallback was explicitly "
+                f"requested. This result spans all of them. Pass region=<index> "
+                f"or region='<body span>' to scope to one table."
             )
             return df, None, warning
         return df, None, None
@@ -676,6 +686,8 @@ async def execute_filter_sheet(
     folder_path: str,
     exact_case: bool = False,
     region: Any = None,
+    *,
+    allow_full_sheet_fallback: bool = False,
 ) -> dict:
     folder_path = folder_path.rstrip("/")
     effective_limit = _clamp_limit(limit)
@@ -685,7 +697,12 @@ async def execute_filter_sheet(
         file_info["item_id"], sheet_name, sheet_info
     )
     full_df, region_used, region_warning = _scope_to_region(
-        full_df, sheet_info, region, file_name, sheet_name
+        full_df,
+        sheet_info,
+        region,
+        file_name,
+        sheet_name,
+        allow_full_sheet_fallback=allow_full_sheet_fallback,
     )
 
     df = full_df
@@ -722,6 +739,147 @@ async def execute_filter_sheet(
     return result
 
 
+async def execute_sheet_layout(
+    file_name: str,
+    sheet_name: str,
+    folder_path: str,
+) -> dict:
+    """Returns a workbook-layout summary for one sheet, including region spans."""
+    folder_path = folder_path.rstrip("/")
+    _, file_info = _get_file_info(folder_path, file_name)
+    sheet_info = _resolve_sheet(file_info, sheet_name, file_name)
+    df, drift = await _fetch_sheet_data(file_info["item_id"], sheet_name, sheet_info)
+
+    region_entries: list[dict[str, Any]] = []
+    used_range_address = sheet_info.get("used_range_address")
+    header_row = sheet_info.get("header_row", 1)
+    for index, entry in enumerate(sheet_info.get("regions") or []):
+        body = entry.get("body")
+        row_count = 0
+        if body and used_range_address:
+            try:
+                start, stop = region_to_df_slice(used_range_address, header_row, body)
+                start = max(start, 0)
+                stop = max(min(stop, len(df)), start)
+                row_count = stop - start
+            except (TypeError, ValueError):
+                row_count = 0
+        region_entries.append(
+            {
+                "index": index,
+                "body": body,
+                "header_row": entry.get("header_row"),
+                "range": entry.get("range"),
+                "source": entry.get("source"),
+                "confidence": entry.get("confidence"),
+                "row_count": row_count,
+            }
+        )
+
+    result = {
+        "file": file_name,
+        "sheet": sheet_name,
+        "header_row": header_row,
+        "columns": sheet_info.get("columns", list(df.columns)),
+        "column_types": sheet_info.get("column_types", {}),
+        "used_range_address": used_range_address,
+        "row_count": len(df),
+        "region_count": len(region_entries),
+        "regions": region_entries,
+        "unclaimed_rows": sheet_info.get("unclaimed_rows", []),
+        "layout_confidence": sheet_info.get("layout_confidence", "unconfirmed"),
+    }
+    if drift:
+        result["structure_drift"] = drift
+    return result
+
+
+async def execute_fetch_sheet_rows(
+    file_name: str,
+    sheet_name: str,
+    folder_path: str,
+    limit: Optional[int] = 500,
+    region: Any = None,
+    *,
+    allow_full_sheet_fallback: bool = False,
+) -> dict:
+    """Returns the live rows for a sheet or a scoped region without the hard cap
+    used by general row-returning queries.
+
+    The default limit keeps the response readable for complex workbooks while the
+    caller can pass limit=None to fetch the full region/sheet. This tool is a
+    factual raw-data dump, so it does not infer or guess structure; it only
+    fetches what the workbook actually contains and labels the region choice.
+    """
+    folder_path = folder_path.rstrip("/")
+    _, file_info = _get_file_info(folder_path, file_name)
+    sheet_info = _resolve_sheet(file_info, sheet_name, file_name)
+    full_df, drift = await _fetch_sheet_data(
+        file_info["item_id"], sheet_name, sheet_info
+    )
+    scoped_df, region_used, region_warning = _scope_to_region(
+        full_df,
+        sheet_info,
+        region,
+        file_name,
+        sheet_name,
+        allow_full_sheet_fallback=allow_full_sheet_fallback,
+    )
+
+    if limit is not None:
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"limit must be an integer or None, got {limit!r}.") from exc
+        if limit <= 0:
+            raise ValueError(f"limit must be a positive integer, got {limit}.")
+        result_df = scoped_df.head(limit)
+        truncated = len(scoped_df) > len(result_df)
+    else:
+        result_df = scoped_df.copy()
+        truncated = False
+
+    result = {
+        "rows": _records(result_df),
+        "file": file_name,
+        "sheet": sheet_name,
+        "row_count": len(result_df),
+        "total_matched": len(scoped_df),
+        "truncated": truncated,
+    }
+    if drift:
+        result["structure_drift"] = drift
+    if region_used:
+        result["region_used"] = region_used
+    if region_warning:
+        result["region_warning"] = region_warning
+    return result
+
+
+async def execute_fetch_region_rows(
+    file_name: str,
+    sheet_name: str,
+    folder_path: str,
+    region: Any,
+    limit: Optional[int] = None,
+) -> dict:
+    """Fetches one exact region, never falling back to the whole sheet."""
+    if region is None:
+        raise ValueError(
+            "region is required for fetch_region_rows; pass the region index or body span "
+            "such as 0 or '7:28'."
+        )
+    result = await execute_fetch_sheet_rows(
+        file_name, sheet_name, folder_path, limit=limit, region=region
+    )
+    if "region_used" not in result:
+        raise ValueError(
+            f"No region resolved for '{file_name}'/'{sheet_name}' with region={region!r}. "
+            "Pass an exact region index or body span from the sheet layout."
+        )
+    return result
+
+
 async def execute_aggregate(
     file_name: str,
     sheet_name: str,
@@ -732,6 +890,8 @@ async def execute_aggregate(
     folder_path: str,
     having: Optional[dict[str, Any]] = None,
     region: Any = None,
+    *,
+    allow_full_sheet_fallback: bool = False,
 ) -> dict:
     folder_path = folder_path.rstrip("/")
     _, file_info = _get_file_info(folder_path, file_name)
@@ -740,7 +900,12 @@ async def execute_aggregate(
         file_info["item_id"], sheet_name, sheet_info
     )
     full_df, region_used, region_warning = _scope_to_region(
-        full_df, sheet_info, region, file_name, sheet_name
+        full_df,
+        sheet_info,
+        region,
+        file_name,
+        sheet_name,
+        allow_full_sheet_fallback=allow_full_sheet_fallback,
     )
 
     df = full_df

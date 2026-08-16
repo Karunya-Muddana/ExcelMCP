@@ -11,10 +11,13 @@ from excelmcp.query_engine import (
     execute_aggregate,
     execute_cross_file_aggregate,
     execute_derive,
+    execute_fetch_region_rows,
+    execute_fetch_sheet_rows,
     execute_filter_sheet,
     execute_inspect_file,
     execute_join_sheets,
     execute_query,
+    execute_sheet_layout,
 )
 from excelmcp.structure import (
     discover_structure,
@@ -534,10 +537,19 @@ async def filter_sheet(
     limit: Optional[int] = None,
     exact_case: bool = False,
     region: Optional[Any] = None,
+    allow_full_sheet_fallback: bool = False,
 ) -> dict:
     folder = _resolve_folder(folder_path)
     result = await execute_filter_sheet(
-        file_name, sheet, conditions, sort_by, limit, folder, exact_case, region
+        file_name,
+        sheet,
+        conditions,
+        sort_by,
+        limit,
+        folder,
+        exact_case,
+        region,
+        allow_full_sheet_fallback=allow_full_sheet_fallback,
     )
     data = {
         "rows": result["rows"],
@@ -550,6 +562,121 @@ async def filter_sheet(
         "region_used",
         "region_warning",
     ):
+        if extra in result:
+            data[extra] = result[extra]
+    return wrap_response(
+        data,
+        [result["file"]],
+        [result["sheet"]],
+        result["row_count"],
+    )
+
+
+@mcp.tool(
+    description="""
+Returns the sheet's live rows, optionally scoped to one table region.
+Use this when the agent needs the raw structure of a complex workbook and
+must see the actual first rows before it can reason about subtables,
+column groupings or header layout. Default limit=500 returns the first
+500 rows of the selected region; set limit=None to fetch the full region.
+If the sheet has multiple table regions and no region is passed, the default
+behavior is strict: it raises and tells you which region to choose instead of
+silently flattening the sheet. Set allow_full_sheet_fallback=True only for a
+specific, explicit whole-sheet read that is clearly labeled in the response.
+This is a factual raw-data read, not a summary or inferred structure guess.
+"""
+)
+async def fetch_sheet_rows(
+    file_name: str,
+    sheet: str,
+    folder_path: Optional[str] = None,
+    limit: Optional[int] = 500,
+    region: Optional[Any] = None,
+    allow_full_sheet_fallback: bool = False,
+) -> dict:
+    folder = _resolve_folder(folder_path)
+    result = await execute_fetch_sheet_rows(
+        file_name,
+        sheet,
+        folder,
+        limit,
+        region,
+        allow_full_sheet_fallback=allow_full_sheet_fallback,
+    )
+    data = {
+        "rows": result["rows"],
+        "total_matched": result["total_matched"],
+        "truncated": result["truncated"],
+    }
+    for extra in ("structure_drift", "region_used", "region_warning"):
+        if extra in result:
+            data[extra] = result[extra]
+    return wrap_response(
+        data,
+        [result["file"]],
+        [result["sheet"]],
+        result["row_count"],
+    )
+
+
+@mcp.tool(
+    description="""
+Returns the sheet layout summary: header row, columns, used range, and each
+region's body span, row count, source, and confidence. Use this to decide
+whether a sheet is one table or several subtables before fetching rows or
+aggregating. This tool is factual metadata about the workbook, not a guess.
+"""
+)
+async def sheet_layout(
+    file_name: str,
+    sheet: str,
+    folder_path: Optional[str] = None,
+) -> dict:
+    folder = _resolve_folder(folder_path)
+    result = await execute_sheet_layout(file_name, sheet, folder)
+    return wrap_response(
+        {
+            "header_row": result["header_row"],
+            "columns": result["columns"],
+            "column_types": result["column_types"],
+            "used_range_address": result["used_range_address"],
+            "row_count": result["row_count"],
+            "region_count": result["region_count"],
+            "regions": result["regions"],
+            "unclaimed_rows": result["unclaimed_rows"],
+            "layout_confidence": result["layout_confidence"],
+            **({"structure_drift": result["structure_drift"]} if "structure_drift" in result else {}),
+        },
+        [result["file"]],
+        [result["sheet"]],
+        result["row_count"],
+    )
+
+
+@mcp.tool(
+    description="""
+Fetches one exact table region by index or body span, and never falls back to
+whole-sheet data. Use this for the strict full-region read when the workbook is
+known to have multiple subtables and a specific region is required. Pass region
+as either the integer index or the body span such as '7:28'.
+"""
+)
+async def fetch_region_rows(
+    file_name: str,
+    sheet: str,
+    region: Any,
+    folder_path: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> dict:
+    folder = _resolve_folder(folder_path)
+    result = await execute_fetch_region_rows(file_name, sheet, folder, region, limit)
+    data = {
+        "rows": result["rows"],
+        "total_matched": result["total_matched"],
+        "truncated": result["truncated"],
+        "region_used": result["region_used"],
+    }
+    for extra in ("structure_drift", "region_warning"):
         if extra in result:
             data[extra] = result[extra]
     return wrap_response(
@@ -575,18 +702,14 @@ For totals across multiple files you MUST use
 cross_file_aggregate instead — never use this tool
 and then manually add results across files.
 Get column names from get_workspace_graph first.
-If the sheet appears in multi_region_sheets, this tool
-will happily add up every region at once — pass region
-(the region's index, e.g. 0, or its body span like
-"7:28" from get_workspace_graph's regions list) to
-restrict to the table you actually mean, applied before
-conditions and grouping. Omit region on a multi-region
-sheet and the response carries region_warning naming
-every region and its span, because the total then spans
-all of them; an unresolvable region raises rather than
-silently using the whole sheet. The region actually used
-comes back as region_used: {index, body, row_count}.
-Returns rows plus a truncated flag. If conditions
+If the sheet appears in multi_region_sheets, the default
+behavior is strict: pass region (the region's index, e.g. 0,
+or its body span like "7:28" from get_workspace_graph's
+regions list) to restrict to the table you actually mean,
+applied before conditions and grouping; omitting it raises
+instead of silently flattening the sheet. The region
+actually used comes back as region_used: {index, body,
+row_count}. Returns rows plus a truncated flag. If conditions
 matched zero rows, zero_match_diagnostics shows what
 each condition matched alone and the values actually
 present — correct the condition and retry.
@@ -602,11 +725,20 @@ async def aggregate(
     conditions: Optional[dict] = None,
     having: Optional[dict] = None,
     region: Optional[Any] = None,
+    allow_full_sheet_fallback: bool = False,
 ) -> dict:
     folder = _resolve_folder(folder_path)
     result = await execute_aggregate(
-        file_name, sheet, group_by, value_col, operation, conditions, folder,
-        having, region,
+        file_name,
+        sheet,
+        group_by,
+        value_col,
+        operation,
+        conditions,
+        folder,
+        having,
+        region,
+        allow_full_sheet_fallback=allow_full_sheet_fallback,
     )
     data = {"rows": result["rows"], "truncated": result["truncated"]}
     for extra in (
