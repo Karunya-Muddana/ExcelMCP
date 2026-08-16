@@ -32,6 +32,10 @@ dependencies = [
     "msal>=1.37.0",
     "numpy>=1.24.0",
     "pandas>=2.3.3",
+    # auth.py imports this directly to wrap MSAL's HTTP client with a timeout.
+    # Previously reached only as a transitive dep of msal, which meant an msal
+    # release could silently break auth. Declared explicitly.
+    "requests>=2.31.0",
     # CLI rendering and agent-config editing. These were previously reached only
     # as transitive deps of fastmcp, which meant a fastmcp release could silently
     # break the wizard. Declared explicitly.

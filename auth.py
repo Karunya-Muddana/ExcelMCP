@@ -6,6 +6,7 @@ import time
 from typing import Any, Callable, Optional
 
 import msal
+import requests
 
 from excelmcp.storage import atomic_write_text, get_config_dir, log
 
@@ -25,12 +26,77 @@ _DEVICE_FLOW_ATTEMPTS = 3
 # visible in every auth request. Override to point at your own tenant's app.
 _DEFAULT_CLIENT_ID = "dd6408d2-c7cf-42fb-926e-7438d6c2aad8"
 
+# MSAL's default HTTP client (requests.Session, no timeout) means a stalled
+# TCP handshake to login.microsoftonline.com — flaky wifi, a filtering
+# campus/corporate proxy, a dropped SSL packet — blocks forever with no way
+# to recover short of killing the process. Every MSAL HTTP call is routed
+# through this session so a bad network fails loud after N seconds instead
+# of hanging the whole scan indefinitely.
+_MSAL_HTTP_TIMEOUT_SECONDS = 20
+
+
+class _TimeoutSession(requests.Session):
+    def request(self, *args, **kwargs):
+        kwargs.setdefault("timeout", _MSAL_HTTP_TIMEOUT_SECONDS)
+        return super().request(*args, **kwargs)
+
 
 def get_auth_config() -> tuple[str, str]:
     client_id = os.environ.get("EXCELMCP_CLIENT_ID", _DEFAULT_CLIENT_ID)
     tenant_id = os.environ.get("EXCELMCP_TENANT_ID", "common")
     authority = f"https://login.microsoftonline.com/{tenant_id}"
     return client_id, authority
+
+
+# msal.PublicClientApplication's constructor performs OIDC tenant discovery —
+# a synchronous network round trip to login.microsoftonline.com — every time
+# it's instantiated. get_token() used to build a brand-new app on every
+# single call and that constructor call was never offloaded to a thread, so
+# it ran directly on the event loop. Scanning N sheets concurrently
+# (structure.py's asyncio.gather over read_sheet) fired N simultaneous
+# blocking HTTP requests, none of them time-bounded, each one capable of
+# freezing every other in-flight task the moment it blocked on
+# socket.connect(). One slow network path froze the entire scan.
+#
+# The app (and its token cache) is now built once per process, lazily,
+# behind a lock so concurrent callers await the same build instead of racing
+# to construct their own — and the construction itself runs in a thread so
+# even a slow first call can't block the loop.
+_app: Optional[msal.PublicClientApplication] = None
+_app_cache: Optional[msal.SerializableTokenCache] = None
+_app_lock = asyncio.Lock()
+
+
+def _build_app() -> tuple[msal.PublicClientApplication, msal.SerializableTokenCache]:
+    """Synchronous MSAL app construction. Always run this via asyncio.to_thread."""
+    client_id, authority = get_auth_config()
+
+    cache = msal.SerializableTokenCache()
+    cache_path = get_token_cache_path()
+    if cache_path.exists():
+        try:
+            cache.deserialize(cache_path.read_text(encoding="utf-8"))
+        except Exception:
+            log("[Auth] Existing token cache is unreadable — re-authenticating.")
+
+    app = msal.PublicClientApplication(
+        client_id,
+        authority=authority,
+        token_cache=cache,
+        http_client=_TimeoutSession(),
+    )
+    return app, cache
+
+
+async def _get_app() -> tuple[msal.PublicClientApplication, msal.SerializableTokenCache]:
+    """Returns the process-wide MSAL app, building it at most once."""
+    global _app, _app_cache
+    if _app is not None:
+        return _app, _app_cache
+    async with _app_lock:
+        if _app is None:
+            _app, _app_cache = await asyncio.to_thread(_build_app)
+    return _app, _app_cache
 
 
 def get_token_cache_path():
@@ -58,6 +124,11 @@ def _persist(cache: msal.SerializableTokenCache) -> None:
         return
     try:
         atomic_write_text(get_token_cache_path(), cache.serialize(), sensitive=True)
+        # The cache is now a process-wide singleton reused across every
+        # get_token() call, not a throwaway per-call object, so this flag
+        # must be cleared after a successful write — otherwise every future
+        # call re-persists the same state to disk forever.
+        cache.has_state_changed = False
     except OSError as exc:
         # A cache we cannot persist costs us a re-auth next run — not fatal now.
         log(f"[Auth] Warning: could not save token cache: {exc}")
@@ -156,18 +227,7 @@ async def get_token(
     force_refresh: bool = False,
     on_device_code: Optional[Callable[[dict], None]] = None,
 ) -> str:
-    client_id, authority = get_auth_config()
-
-    cache = msal.SerializableTokenCache()
-    cache_path = get_token_cache_path()
-
-    if cache_path.exists():
-        try:
-            cache.deserialize(cache_path.read_text(encoding="utf-8"))
-        except Exception:
-            log("[Auth] Existing token cache is unreadable — re-authenticating.")
-
-    app = msal.PublicClientApplication(client_id, authority=authority, token_cache=cache)
+    app, cache = await _get_app()
 
     accounts = app.get_accounts()
     if accounts:

@@ -4,9 +4,9 @@ from typing import Any, Optional
 
 from fastmcp import FastMCP
 
-from excelmcp.embeddings import update_embeddings
-from excelmcp.lookup import execute_get_cell, execute_lookup
-from excelmcp.query_engine import (
+from embeddings import update_embeddings
+from lookup import execute_get_cell, execute_lookup
+from query_engine import (
     MAX_ROWS_RETURNED,
     execute_aggregate,
     execute_cross_file_aggregate,
@@ -16,7 +16,7 @@ from excelmcp.query_engine import (
     execute_join_sheets,
     execute_query,
 )
-from excelmcp.structure import (
+from structure import (
     discover_structure,
     load_graph,
     sheet_name_variants,
@@ -47,6 +47,13 @@ to discover what files and sheets exist in this workspace.
 The structure is different for every company and every
 folder. Never assume file names, sheet names, or column
 names — always discover them from the graph first.
+Its default detail='summary' is deliberately compact so
+it stays affordable on large workspaces: it carries every
+filename, sheet name, column name and column type, plus
+the region map for multi-region sheets. Reach for
+inspect_file when you need one file in full, and
+detail='full' only when you genuinely need sampled
+values, sheet descriptions or the raw relationship list.
 
 RULE 3 — NEVER CALCULATE CROSS-FILE TOTALS IN YOUR HEAD
 If a question involves more than one file, you MUST call
@@ -116,6 +123,14 @@ the value with file/sheet/cell provenance in one call.
 Check its confidence field, surface conflicts and
 ambiguity instead of picking a value, and always cite
 where the number came from.
+
+RULE 13 — A SHEET WITH SEVERAL REGIONS IS SEVERAL TABLES
+multi_region_sheets in get_workspace_graph lists every
+sheet holding more than one table body. Aggregating one
+of those without restricting to the region you mean adds
+up blocks that were never meant to be summed. Read its
+regions and unclaimed_rows, decide which table answers
+the question, and say which one you used.
 """,
 )
 
@@ -163,37 +178,117 @@ def wrap_response(
     }
 
 
+# ---------------------------------------------------------------- graph views
+#
+# The workspace graph carries two kinds of thing, and only one of them belongs
+# in a tool response.
+#
+#   Structure    — filenames, sheet names, header rows, column names and types.
+#                  The model cannot query anything without these.
+#   Routing evidence — per-sheet `description` text, `sampled_values`,
+#                  `columns_raw`, single-sheet region maps, `layout_confidence`.
+#                  These exist so the embeddings can tell twenty structurally
+#                  identical workbooks apart. They do their work at routing
+#                  time; the model never needs to read them.
+#
+# Shipping both put a 21-file workspace at ~188k characters — roughly 47k
+# tokens for the one call RULE 2 makes mandatory, which overflowed the tool
+# result and returned truncated JSON. Structure alone is about a fifth of that.
+# Hence: summary by default, everything behind detail='full'.
+
+_SUMMARY_SHEET_KEYS = (
+    "header_row",
+    "header_source",
+    "columns",
+    "column_types",
+    "used_range_address",
+    "row_count",
+    "column_count",
+    "approx_row_count",
+)
+
+
+def _summarize_sheet(sheet: dict) -> dict:
+    """Structure only — but the region map survives where it changes an answer.
+
+    A single-region sheet's region list tells the model nothing it would act on,
+    so it collapses to a count. A multi-region sheet is the one case where an
+    unqualified aggregate silently sums unrelated blocks, so its regions,
+    unclaimed_rows and layout_confidence travel in full even in summary mode.
+    """
+    out = {k: sheet[k] for k in _SUMMARY_SHEET_KEYS if k in sheet}
+    regions = sheet.get("regions") or []
+    out["region_count"] = len(regions)
+    if len(regions) > 1:
+        out["regions"] = regions
+        out["unclaimed_rows"] = sheet.get("unclaimed_rows", [])
+        out["layout_confidence"] = sheet.get("layout_confidence", "unconfirmed")
+    return out
+
+
+def _summarize_files(files: dict) -> dict:
+    return {
+        name: {
+            "last_scanned": info.get("last_scanned"),
+            "sheets": {
+                sheet_name: _summarize_sheet(sheet_info)
+                for sheet_name, sheet_info in info.get("sheets", {}).items()
+            },
+        }
+        for name, info in files.items()
+    }
+
+
 @mcp.tool(
     description="""
-Returns the cached file structure — all filenames, sheet
-names, column headers, and cross-sheet relationships
-(inferred at scan time from matching column names plus
-overlapping sampled values, merged with any the user
-declared in ~/.excelmcp/relationships.yaml; each carries
-a confidence score and its evidence).
+Returns the cached structure of the workspace — every
+filename, sheet name, column header, column type and
+header row.
 INSTANT — makes no API call. Reads from local graph.json.
 ALWAYS call this first at session start to orient yourself.
-Shows you exactly which files exist, what sheets they have,
-and what columns are in each sheet. The structure varies
-for every company — never assume, always discover.
-Also returns sheet_name_variants: groups of sheet names
-that differ only in case or whitespace across files —
-check it before any cross-file operation, because those
-match by exact sheet name.
-Each sheet carries a `regions` list: the table bodies found
-in it, derived from the sheet's own SUM/COUNT formulas, in
-absolute sheet rows. A sheet with more than one region holds
-several separate tables (also listed in multi_region_sheets),
-so a plain aggregate over it adds up blocks that were never
-meant to be summed — read its unclaimed_rows and check which
-region you mean before totalling anything.
-layout_confidence is "unconfirmed" wherever the region map
-came from formulas alone and nothing has verified it.
+The structure varies for every company — never assume,
+always discover.
+
+detail='summary' (the DEFAULT, and what you want almost
+always) returns structure only. It is compact enough to
+call on a large workspace without burning your context.
+detail='full' additionally returns each sheet's sampled
+values and description text, plus the full inferred
+relationship list with its evidence. These are routing
+evidence — the semantic router already uses them on your
+behalf — so ask for them only when you specifically need
+to inspect what values a column contains.
+
+Also returns:
+- sheet_name_variants: groups of sheet names that differ
+  only in case or whitespace across files. Check it before
+  any cross-file operation, because those match by exact
+  sheet name and a variant silently shrinks a total.
+- multi_region_sheets: sheets holding more than one table
+  body. Each such sheet also keeps its `regions` list (the
+  table bodies in absolute sheet rows, derived from the
+  sheet's own SUM/COUNT formulas), its `unclaimed_rows`,
+  and layout_confidence, which reads "unconfirmed" wherever
+  the region map came from formulas alone and nothing has
+  verified it. A plain aggregate over one of these adds up
+  blocks that were never meant to be summed — pick the
+  region you mean first.
+- relationships_available: how many cross-sheet join keys
+  are known. You do not need to read them: call join_sheets
+  without left_on/right_on and the server resolves a key
+  from this set, refusing with candidates when confidence
+  is low. Pass detail='full' to see them.
+- scan_age: how old the index is, with a note when it is
+  stale enough that renamed sheets may mis-resolve.
+
 Use this before any filter_sheet call when unsure which
 file or column to query.
 """
 )
-async def get_workspace_graph(folder_path: Optional[str] = None) -> dict:
+async def get_workspace_graph(
+    folder_path: Optional[str] = None,
+    detail: str = "summary",
+) -> dict:
     folder = _resolve_folder(folder_path)
     graph = load_graph()
     workspace = graph.get("workspaces", {}).get(folder)
@@ -208,13 +303,48 @@ async def get_workspace_graph(folder_path: Optional[str] = None) -> dict:
             [],
             0,
         )
-    file_names = list(workspace.get("files", {}).keys())
+
+    detail = (detail or "summary").strip().lower()
+    if detail not in ("summary", "full"):
+        return wrap_response(
+            {
+                "error": f"Unknown detail '{detail}'. Use 'summary' or 'full'.",
+            },
+            [],
+            [],
+            0,
+        )
+    full = detail == "full"
+
+    files = workspace.get("files", {})
+    file_names = list(files.keys())
     data = dict(workspace)
+    data["detail"] = detail
+    if not full:
+        data["files"] = _summarize_files(files)
+
     # Sheet-name fragmentation ('Sales' vs 'sales ' vs 'SALES') silently
     # shrinks cross-file totals; surface it before the agent aggregates.
-    data["sheet_name_variants"] = sheet_name_variants(workspace.get("files", {}))
+    # Computed from the unsummarized files — variants live in the keys.
+    data["sheet_name_variants"] = sheet_name_variants(files)
+
     # Declared relationships (relationships.yaml) merged ahead of inferred.
-    data["relationships"] = workspace_relationships(workspace)
+    # join_sheets resolves these server-side, so summary mode reports only that
+    # they exist: on a workspace this size the list alone ran to ~75k characters
+    # of text the model would never act on directly.
+    relationships = workspace_relationships(workspace)
+    if full:
+        data["relationships"] = relationships
+    else:
+        data.pop("relationships", None)
+        data["relationships_available"] = len(relationships)
+        data["relationships_note"] = (
+            "Join keys resolve server-side: call join_sheets without "
+            "left_on/right_on and it picks from these, refusing with the "
+            "candidate list when confidence is low. Pass detail='full' to "
+            "read them."
+        )
+
     # Sheets holding more than one table region: an unqualified aggregate over
     # one of these sums blocks that were never meant to be added together.
     data["multi_region_sheets"] = [
@@ -224,11 +354,11 @@ async def get_workspace_graph(folder_path: Optional[str] = None) -> dict:
             "regions": len(sheet_info.get("regions", [])),
             "layout_confidence": sheet_info.get("layout_confidence", "unconfirmed"),
         }
-        for file_name, file_info in workspace.get("files", {}).items()
+        for file_name, file_info in files.items()
         for sheet_name, sheet_info in file_info.get("sheets", {}).items()
         if len(sheet_info.get("regions", [])) > 1
     ]
-    scan_age = _scan_age(workspace.get("files", {}))
+    scan_age = _scan_age(files)
     if scan_age:
         data["scan_age"] = scan_age
     return wrap_response(data, file_names, [], 0)
@@ -424,6 +554,10 @@ For totals across multiple files you MUST use
 cross_file_aggregate instead — never use this tool
 and then manually add results across files.
 Get column names from get_workspace_graph first.
+If the sheet appears in multi_region_sheets, this tool
+will happily add up every region at once — restrict with
+conditions to the table you actually mean, or the total
+will be several unrelated tables stacked together.
 Returns rows plus a truncated flag. If conditions
 matched zero rows, zero_match_diagnostics shows what
 each condition matched alone and the values actually
@@ -484,6 +618,10 @@ skipped_files, or unmatched_files, surface that to the
 user: the total may be incomplete. Check
 sheet_name_variants in get_workspace_graph first to see
 naming fragmentation before aggregating.
+A total is only meaningful if the column means the same
+thing in every file — same unit, same currency. Two files
+can share a sheet and column name and still be
+incommensurable; check before reporting one number.
 """
 )
 async def cross_file_aggregate(
@@ -523,7 +661,10 @@ no API call, so the count is not live; treat it as an
 order-of-magnitude hint, not a current figure).
 INSTANT — reads from cached graph.json.
 Use before filter_sheet when you need to confirm the
-exact column names available in a specific file.
+exact column names available in a specific file, and in
+preference to get_workspace_graph(detail='full') when
+your question concerns one file: the payload is a
+fraction of the size.
 """
 )
 async def inspect_file(file_name: str, folder_path: Optional[str] = None) -> dict:
@@ -543,7 +684,9 @@ the workspace's known relationships — it uses a declared
 or high-confidence inferred relationship and REFUSES
 with the candidate list when confidence is low, rather
 than guessing. The keys actually used and their source
-are in data.keys.
+are in data.keys. You do NOT need to fetch the
+relationship list first; this resolution is why
+get_workspace_graph does not ship it by default.
 Key matching is normalised (case, whitespace, 45 vs
 45.0); null keys never join. join_type: inner, left,
 right, outer. Colliding column names get _left/_right
@@ -600,6 +743,13 @@ components is a list of
    "sign": 1 or -1, "label": "receipts"}
 conditions (optional) pre-filters the sheet before any
 component applies.
+
+THE SIGN IS YOURS TO DECIDE, NOT THE SHEET'S. Outbound
+movements — returns, issues, consumption — are very often
+stored as POSITIVE quantities and distinguished only by a
+type label. Read the transaction-type values before
+choosing signs, and never assume the column is already
+signed because the numbers look plausible.
 The response includes a per-component breakdown with
 rows_matched. A component that matched ZERO rows is
 flagged and warned about — check the spelling of the
@@ -693,6 +843,10 @@ found=false   — key not found; suggestions holds fuzzy
                 or ambiguity explains why routing failed.
 NEVER present a value from this tool without citing
 provenance.file, provenance.sheet and provenance.cell.
+An "ambiguous" or "conflict" result is a CORRECT ANSWER,
+not a failure to work around. Report it as such rather
+than retrying with a narrower scope until one value
+survives.
 """
 )
 async def lookup(
