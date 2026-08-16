@@ -63,3 +63,43 @@ def build_range(col1: int, row1: int, col2: int, row2: int) -> str:
 def build_cell(col: int, row: int) -> str:
     """(8, 347) -> 'H347'."""
     return f"{index_to_col(col)}{row}"
+
+
+def parse_span(text: str) -> tuple[int, int]:
+    """'7:28' -> (7, 28). Whitespace around the colon and numbers is tolerated."""
+    parts = str(text).split(":")
+    if len(parts) != 2:
+        raise ValueError(f"Cannot parse row span: {text!r}. Expected 'first:last'.")
+    try:
+        first, last = int(parts[0].strip()), int(parts[1].strip())
+    except ValueError:
+        raise ValueError(f"Cannot parse row span: {text!r}. Expected 'first:last'.")
+    return first, last
+
+
+def region_to_df_slice(
+    used_range_address: str, header_row: int, body: str
+) -> tuple[int, int]:
+    """Converts a region's absolute body span into a DataFrame row slice.
+
+    ``used_range_address`` is the sheet's used-range address (e.g.
+    ``"Sheet1!C5:H60"``); ``header_row`` is the 1-based offset of the header
+    into that used range — the convention ``sheet_info["header_row"]`` already
+    uses. ``body`` is a region's ``"body"`` span in absolute 1-based sheet
+    rows, e.g. ``"7:28"``.
+
+    A DataFrame built by ``_fetch_sheet_data`` has row 0 sitting on the sheet
+    row immediately below the header, so absolute row ``r`` lands at index
+    ``r - header_abs - 1`` where ``header_abs = row1 + header_row - 1``.
+
+    Returns ``(start, stop)`` — a 0-based, half-open slice suitable for
+    ``df.iloc[start:stop]``. Neither bound is clamped to the frame's actual
+    length; callers must clamp against ``len(df)`` themselves, since only they
+    know it.
+    """
+    _, row1, _, _ = parse_range(used_range_address)
+    header_abs = row1 + header_row - 1
+    body_start, body_end = parse_span(body)
+    start = body_start - header_abs - 1
+    stop = body_end - header_abs
+    return start, stop

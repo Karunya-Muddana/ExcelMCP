@@ -8,6 +8,7 @@ import pandas as pd
 
 from excelmcp.embeddings import search
 from excelmcp.graph_client import GraphAPIError, get_used_range
+from excelmcp.ranges import parse_span, region_to_df_slice
 from excelmcp.storage import log
 from excelmcp.structure import (
     columns_from_row,
@@ -411,6 +412,98 @@ def _resolve_sheet(
     return sheets[sheet_name]
 
 
+def _region_summary(index: int, region: dict[str, Any]) -> dict[str, Any]:
+    return {"index": index, "body": region.get("body"), "header_row": region.get("header_row")}
+
+
+def _resolve_region(
+    sheet_info: dict[str, Any], region: Any, file_name: str, sheet_name: str
+) -> Optional[tuple[int, dict[str, Any]]]:
+    """Resolves `region` to (index, region_entry) in sheet_info['regions'].
+
+    `region` is either an integer index or a 'first:last' absolute-row span
+    matching a region's body. None (the default) resolves to None — no
+    scoping. An index out of range or a span matching nothing is a caller
+    mistake, not a request to fall back to the whole sheet, so both raise
+    with the available regions listed rather than silently ignoring `region`.
+    """
+    if region is None:
+        return None
+    regions = sheet_info.get("regions") or []
+    if isinstance(region, bool):
+        raise ValueError(
+            f"region must be an integer index or a 'first:last' span string, "
+            f"got {region!r}."
+        )
+    if isinstance(region, int):
+        if 0 <= region < len(regions):
+            return region, regions[region]
+        raise ValueError(
+            f"region index {region} is out of range for '{file_name}'/"
+            f"'{sheet_name}': it has {len(regions)} region(s): "
+            f"{[_region_summary(i, r) for i, r in enumerate(regions)]}"
+        )
+    if isinstance(region, str):
+        wanted = parse_span(region)
+        for i, r in enumerate(regions):
+            body = r.get("body")
+            if body and parse_span(body) == wanted:
+                return i, r
+        raise ValueError(
+            f"region '{region}' matches no region body on '{file_name}'/"
+            f"'{sheet_name}'. Available regions: "
+            f"{[_region_summary(i, r) for i, r in enumerate(regions)]}"
+        )
+    raise ValueError(
+        f"region must be an integer index or a 'first:last' span string, "
+        f"got {region!r}."
+    )
+
+
+def _scope_to_region(
+    df: pd.DataFrame,
+    sheet_info: dict[str, Any],
+    region: Any,
+    file_name: str,
+    sheet_name: str,
+) -> tuple[pd.DataFrame, Optional[dict[str, Any]], Optional[str]]:
+    """Slices `df` to one table region when asked; warns when it should have been.
+
+    Returns (scoped_df, region_used, region_warning). On a sheet with more
+    than one region and no `region` given, the frame is returned unscoped
+    (today's behaviour) but region_warning names how many regions exist and
+    their body spans, so a total that spans several tables is visibly one.
+    """
+    regions = sheet_info.get("regions") or []
+    resolved = _resolve_region(sheet_info, region, file_name, sheet_name)
+    if resolved is None:
+        if len(regions) > 1:
+            spans = ", ".join(f"{i}: {r.get('body')}" for i, r in enumerate(regions))
+            warning = (
+                f"'{sheet_name}' in '{file_name}' holds {len(regions)} table "
+                f"regions ({spans}) and no `region` was given — this result "
+                f"spans all of them. Pass region=<index> or region='<body span>' "
+                f"to scope to one table."
+            )
+            return df, None, warning
+        return df, None, None
+
+    index, entry = resolved
+    used_range_address = sheet_info.get("used_range_address")
+    if not used_range_address:
+        raise ValueError(
+            f"'{sheet_name}' in '{file_name}' has no used_range_address on "
+            f"record — run scan_workspace to rebuild the structure graph."
+        )
+    header_row = sheet_info.get("header_row", 1)
+    start, stop = region_to_df_slice(used_range_address, header_row, entry["body"])
+    start = max(start, 0)
+    stop = max(min(stop, len(df)), start)
+    scoped = df.iloc[start:stop].copy()
+    region_used = {"index": index, "body": entry.get("body"), "row_count": len(scoped)}
+    return scoped, region_used, None
+
+
 def _clamp_limit(limit: Optional[int]) -> int:
     """Normalises a caller-supplied row limit into [1, MAX_ROWS_RETURNED]."""
     if limit is None:
@@ -582,6 +675,7 @@ async def execute_filter_sheet(
     limit: Optional[int],
     folder_path: str,
     exact_case: bool = False,
+    region: Any = None,
 ) -> dict:
     folder_path = folder_path.rstrip("/")
     effective_limit = _clamp_limit(limit)
@@ -589,6 +683,9 @@ async def execute_filter_sheet(
     sheet_info = _resolve_sheet(file_info, sheet_name, file_name)
     full_df, drift = await _fetch_sheet_data(
         file_info["item_id"], sheet_name, sheet_info
+    )
+    full_df, region_used, region_warning = _scope_to_region(
+        full_df, sheet_info, region, file_name, sheet_name
     )
 
     df = full_df
@@ -618,6 +715,10 @@ async def execute_filter_sheet(
         )
     if drift:
         result["structure_drift"] = drift
+    if region_used:
+        result["region_used"] = region_used
+    if region_warning:
+        result["region_warning"] = region_warning
     return result
 
 
@@ -630,12 +731,16 @@ async def execute_aggregate(
     conditions: Optional[dict[str, Any]],
     folder_path: str,
     having: Optional[dict[str, Any]] = None,
+    region: Any = None,
 ) -> dict:
     folder_path = folder_path.rstrip("/")
     _, file_info = _get_file_info(folder_path, file_name)
     sheet_info = _resolve_sheet(file_info, sheet_name, file_name)
     full_df, drift = await _fetch_sheet_data(
         file_info["item_id"], sheet_name, sheet_info
+    )
+    full_df, region_used, region_warning = _scope_to_region(
+        full_df, sheet_info, region, file_name, sheet_name
     )
 
     df = full_df
@@ -682,6 +787,10 @@ async def execute_aggregate(
         )
     if drift:
         response["structure_drift"] = drift
+    if region_used:
+        response["region_used"] = region_used
+    if region_warning:
+        response["region_warning"] = region_warning
     return response
 
 
@@ -1069,16 +1178,32 @@ async def execute_derive(
     folder_path: str,
     file_name: str,
     sheet_name: str,
-    group_by: Any,
-    quantity_col: str,
-    components: list[dict[str, Any]],
+    # group_by, quantity_col and components are all conceptually required —
+    # every current caller passes them — but Python requires that anything
+    # after the first defaulted positional (group_by, made optional per RULE)
+    # carry a default too. Their validation below still raises when missing.
+    group_by: Any = None,
+    quantity_col: Optional[str] = None,
+    components: Optional[list[dict[str, Any]]] = None,
     conditions: Optional[dict[str, Any]] = None,
+    region: Any = None,
 ) -> dict:
     """Signed sum over transaction types: the five-call stock calculation in one.
 
     Each component is {"conditions": {...}, "sign": +1|-1, "label": ...}; the
     result is sum(sign * groupwise_sum(quantity)) per grouping key, computed in
     pandas where it is deterministic instead of in the model where it is not.
+
+    A component may use "base": true instead of "sign" — shorthand for sign 1,
+    meant for a one-off row like an opening balance (conditions matching it,
+    e.g. a blank transaction-type column, are the caller's to state; nothing
+    here guesses which row that is). It still goes through the same
+    conditions/sign pipeline and the same matched_no_rows flagging as any
+    other component, so a mistyped opening-balance condition is reported the
+    same honest way a mistyped transaction type already is.
+
+    group_by is optional: omit it to get one net total over every matching
+    row instead of one row per group.
     """
     folder_path = folder_path.rstrip("/")
     if not isinstance(components, list) or not components:
@@ -1086,49 +1211,69 @@ async def execute_derive(
             "components must be a non-empty list of "
             "{'conditions': {...}, 'sign': 1 or -1, 'label': optional}."
         )
+    signs: list[int] = []
     for i, comp in enumerate(components):
         if not isinstance(comp, dict) or not isinstance(comp.get("conditions"), dict):
             raise ValueError(f"components[{i}] needs a 'conditions' object.")
-        if comp.get("sign") not in (1, -1):
-            raise ValueError(f"components[{i}] needs 'sign': 1 or -1.")
+        sign = comp.get("sign")
+        if sign is None and comp.get("base") is True:
+            sign = 1
+        if sign not in (1, -1):
+            raise ValueError(
+                f"components[{i}] needs 'sign': 1 or -1 (or 'base': true, which "
+                f"implies sign 1, for a one-off row like an opening balance)."
+            )
+        signs.append(sign)
 
-    group_cols = group_by if isinstance(group_by, list) else [group_by]
-    if not group_cols or not all(isinstance(g, str) and g for g in group_cols):
-        raise ValueError(
-            f"group_by must be a column name or a list of them, got {group_by!r}."
-        )
+    group_cols: Optional[list[str]] = None
+    if group_by is not None:
+        group_cols = group_by if isinstance(group_by, list) else [group_by]
+        if not group_cols or not all(isinstance(g, str) and g for g in group_cols):
+            raise ValueError(
+                f"group_by must be a column name or a list of them, got {group_by!r}."
+            )
 
     _, file_info = _get_file_info(folder_path, file_name)
     sheet_info = _resolve_sheet(file_info, sheet_name, file_name)
     df, drift = await _fetch_sheet_data(
         file_info["item_id"], sheet_name, sheet_info
     )
+    df, region_used, region_warning = _scope_to_region(
+        df, sheet_info, region, file_name, sheet_name
+    )
 
     if quantity_col not in df.columns:
         raise ValueError(
             f"Column '{quantity_col}' not found. Available: {list(df.columns)}"
         )
-    missing_groups = [g for g in group_cols if g not in df.columns]
-    if missing_groups:
-        raise ValueError(
-            f"group_by column(s) {missing_groups} not found. "
-            f"Available: {list(df.columns)}"
-        )
+    if group_cols:
+        missing_groups = [g for g in group_cols if g not in df.columns]
+        if missing_groups:
+            raise ValueError(
+                f"group_by column(s) {missing_groups} not found. "
+                f"Available: {list(df.columns)}"
+            )
 
     if conditions:
         df = _apply_conditions(df, conditions)
     df[quantity_col] = pd.to_numeric(df[quantity_col], errors="coerce")
 
     net: Optional[pd.Series] = None
+    net_scalar = 0.0
     breakdown = []
-    for i, comp in enumerate(components):
+    for i, (comp, sign) in enumerate(zip(components, signs)):
         part = _apply_conditions(df, comp["conditions"])
-        sums = part.groupby(group_cols)[quantity_col].sum() * comp["sign"]
-        subtotal = float(sums.sum()) if len(sums) else 0.0
+        if group_cols:
+            sums = part.groupby(group_cols)[quantity_col].sum() * sign
+            subtotal = float(sums.sum()) if len(sums) else 0.0
+            net = sums if net is None else net.add(sums, fill_value=0.0)
+        else:
+            subtotal = float(part[quantity_col].sum()) * sign if len(part) else 0.0
+            net_scalar += subtotal
         breakdown.append(
             {
                 "label": comp.get("label") or f"component_{i}",
-                "sign": comp["sign"],
+                "sign": sign,
                 "rows_matched": int(len(part)),
                 "subtotal": subtotal,
                 # A component matching nothing is how a typo'd transaction
@@ -1136,11 +1281,13 @@ async def execute_derive(
                 "matched_no_rows": len(part) == 0,
             }
         )
-        net = sums if net is None else net.add(sums, fill_value=0.0)
 
-    result_frame = (net if net is not None else pd.Series(dtype=float)).reset_index()
-    if len(result_frame.columns) == len(group_cols) + 1:
-        result_frame.columns = [*group_cols, "net"]
+    if group_cols:
+        result_frame = (net if net is not None else pd.Series(dtype=float)).reset_index()
+        if len(result_frame.columns) == len(group_cols) + 1:
+            result_frame.columns = [*group_cols, "net"]
+    else:
+        result_frame = pd.DataFrame([{"net": net_scalar}])
 
     response: dict[str, Any] = {
         "rows": _records(result_frame.head(MAX_ROWS_RETURNED)),
@@ -1159,4 +1306,8 @@ async def execute_derive(
         )
     if drift:
         response["structure_drift"] = drift
+    if region_used:
+        response["region_used"] = region_used
+    if region_warning:
+        response["region_warning"] = region_warning
     return response

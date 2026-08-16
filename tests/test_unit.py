@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from excelmcp import auth, embeddings, graph_client, query_engine, storage, structure
+from excelmcp import auth, embeddings, graph_client, query_engine, ranges, storage, structure
 from excelmcp.structure import GRAPH_SCHEMA_VERSION as SCHEMA
 from excelmcp.graph_client import (
     _parse_retry_after,
@@ -832,10 +832,10 @@ class TestDerive:
 
         monkeypatch.setattr(query_engine, "_fetch_sheet_data", fake_fetch)
 
-    def _derive(self, components, **kwargs):
+    def _derive(self, components, group_by="Material", **kwargs):
         return asyncio.run(
             query_engine.execute_derive(
-                "/ERP", "tx.xlsx", "Transactions", "Material", "Qty",
+                "/ERP", "tx.xlsx", "Transactions", group_by, "Qty",
                 components, **kwargs,
             )
         )
@@ -876,6 +876,209 @@ class TestDerive:
                     [{"conditions": {"Type": "Receipt"}, "sign": 1}],
                 )
             )
+
+    def test_group_by_omitted_returns_single_net_total(self):
+        # Receipts across every material (100 + 50 + 7) minus consumption (30).
+        result = self._derive(
+            [
+                {"conditions": {"Type": "Receipt"}, "sign": 1, "label": "receipts"},
+                {"conditions": {"Type": "Consumption"}, "sign": -1, "label": "consumption"},
+            ],
+            group_by=None,
+        )
+        assert result["rows"] == [{"net": 127.0}]
+        assert "Material" not in (result["rows"][0] if result["rows"] else {})
+
+    def test_explicit_empty_group_by_still_errors(self):
+        # Only an *omitted* group_by (None) means "no grouping" — an explicit
+        # [] is still a caller mistake, not a synonym for the same thing.
+        with pytest.raises(ValueError, match="group_by"):
+            self._derive(
+                [{"conditions": {"Type": "Receipt"}, "sign": 1}], group_by=[]
+            )
+
+    def test_base_component_defaults_sign_to_one_and_is_flagged_like_any_other(self):
+        result = self._derive(
+            [
+                {"conditions": {"Type": "Receipt"}, "sign": 1, "label": "receipts"},
+                {
+                    "conditions": {"Material": "ZnO"},
+                    "base": True,
+                    "label": "zno_adjustment",
+                },
+                {
+                    "conditions": {"Material": "Nonexistent"},
+                    "base": True,
+                    "label": "typo_check",
+                },
+            ]
+        )
+        by_label = {c["label"]: c for c in result["components"]}
+        assert by_label["zno_adjustment"]["sign"] == 1
+        assert by_label["zno_adjustment"]["matched_no_rows"] is False
+        assert by_label["typo_check"]["matched_no_rows"] is True
+        assert "typo_check" in result["warning"]
+
+
+# --------------------------------------------------------- region scoping
+
+
+class TestRegionToDfSlice:
+    """ranges.region_to_df_slice: the absolute-row <-> DataFrame-index arithmetic
+    that filter_sheet/aggregate/derive lean on for `region`. An off-by-one here
+    produces a plausible wrong number, not an error, so it is pinned exactly."""
+
+    def test_header_at_top_of_used_range(self):
+        # used range starts on the header row itself (row1 == header_abs == 5).
+        # DataFrame row 0 is sheet row 6, so body '7:15' starts at df index 1.
+        assert ranges.region_to_df_slice("Sheet1!C5:E30", 1, "7:15") == (1, 10)
+
+    def test_used_range_starts_above_the_header(self):
+        # used range starts at row 3, header is 3 rows into it (row 5) — same
+        # header_abs as above, so the same span must resolve identically.
+        assert ranges.region_to_df_slice("Sheet1!C3:E30", 3, "7:15") == (1, 10)
+
+    def test_row_immediately_below_header_is_df_index_zero(self):
+        assert ranges.region_to_df_slice("Sheet1!C5:E30", 1, "6:6") == (0, 1)
+
+    def test_second_region_is_offset_correctly(self):
+        assert ranges.region_to_df_slice("Sheet1!C5:E30", 1, "20:28") == (14, 23)
+
+    def test_parse_span_tolerates_whitespace(self):
+        assert ranges.parse_span(" 7 : 28 ") == (7, 28)
+
+    def test_parse_span_rejects_malformed_text(self):
+        with pytest.raises(ValueError):
+            ranges.parse_span("not-a-span")
+
+
+def _region_graph():
+    """A sheet with two disjoint table regions (mirrors the Naphthalene/Oleum
+    layout) and a single-region sheet, sharing one used-range convention:
+    used range starts on the header row, so header_abs == row1 for both."""
+    two_table_regions = [
+        {
+            "type": "table", "range": "5:15", "body": "7:15",
+            "header_row": 5, "source": "formula", "confidence": "unconfirmed",
+        },
+        {
+            "type": "table", "range": "18:28", "body": "20:28",
+            "header_row": 19, "source": "formula", "confidence": "unconfirmed",
+        },
+    ]
+    return {
+        "workspaces": {
+            "/ERP": {
+                "schema_version": SCHEMA,
+                "files": {
+                    "stmt.xlsx": {
+                        "item_id": "stmt",
+                        "sheets": {
+                            "Two Tables": {
+                                "header_row": 1,
+                                "columns": ["Type", "Qty"],
+                                "used_range_address": "Two Tables!C5:D30",
+                                "regions": two_table_regions,
+                            },
+                            "One Table": {
+                                "header_row": 1,
+                                "columns": ["Type", "Qty"],
+                                "used_range_address": "One Table!C5:D15",
+                                "regions": [two_table_regions[0]],
+                            },
+                        },
+                    }
+                },
+            }
+        }
+    }
+
+
+class TestRegionScoping:
+    @pytest.fixture(autouse=True)
+    def patched(self, monkeypatch):
+        monkeypatch.setattr(query_engine, "load_graph", lambda: _region_graph())
+
+        async def fake_fetch(item_id, sheet_name, sheet_info=None):
+            # Two Tables' used range starts at sheet row 5 -> df row 0 == row 6.
+            rows = list(range(6, 31)) if sheet_name == "Two Tables" else list(range(6, 16))
+            df = pd.DataFrame(
+                {
+                    "Type": ["Receipt" if r % 2 == 0 else "Return" for r in rows],
+                    "Qty": rows,
+                    "AbsRow": rows,
+                }
+            )
+            return df, None
+
+        monkeypatch.setattr(query_engine, "_fetch_sheet_data", fake_fetch)
+
+    def _filter(self, sheet, region=None):
+        return asyncio.run(
+            query_engine.execute_filter_sheet(
+                "stmt.xlsx", sheet, {}, None, None, "/ERP", False, region
+            )
+        )
+
+    def test_index_and_span_resolve_to_the_same_rows(self):
+        by_index = self._filter("Two Tables", region=0)
+        by_span = self._filter("Two Tables", region="7:15")
+        assert sorted(r["AbsRow"] for r in by_index["rows"]) == list(range(7, 16))
+        assert sorted(r["AbsRow"] for r in by_span["rows"]) == list(range(7, 16))
+        assert by_index["region_used"] == {"index": 0, "body": "7:15", "row_count": 9}
+        assert by_span["region_used"] == by_index["region_used"]
+
+    def test_second_region_is_disjoint_from_the_first(self):
+        result = self._filter("Two Tables", region=1)
+        assert sorted(r["AbsRow"] for r in result["rows"]) == list(range(20, 29))
+        assert result["region_used"]["index"] == 1
+
+    def test_out_of_range_index_errors_listing_available_regions(self):
+        with pytest.raises(ValueError, match="out of range"):
+            self._filter("Two Tables", region=5)
+
+    def test_unmatched_span_errors_rather_than_falling_back_to_whole_sheet(self):
+        with pytest.raises(ValueError, match="matches no region"):
+            self._filter("Two Tables", region="100:200")
+
+    def test_omitted_region_on_multi_region_sheet_warns_and_sees_everything(self):
+        result = self._filter("Two Tables")
+        assert "region_used" not in result
+        assert "2 table" in result["region_warning"]
+        assert "7:15" in result["region_warning"] and "20:28" in result["region_warning"]
+        assert len(result["rows"]) == 25  # unscoped: rows 6..30
+
+    def test_omitted_region_on_single_region_sheet_is_unaffected(self):
+        result = self._filter("One Table")
+        assert "region_used" not in result
+        assert "region_warning" not in result
+        assert len(result["rows"]) == 10  # unscoped: rows 6..15
+
+    def test_aggregate_scoped_to_region_sums_only_that_table(self):
+        result = asyncio.run(
+            query_engine.execute_aggregate(
+                "stmt.xlsx", "Two Tables", "Type", "Qty", "sum", None, "/ERP",
+                None, 0,
+            )
+        )
+        assert sum(r["Qty"] for r in result["rows"]) == sum(range(7, 16))
+        assert result["region_used"]["body"] == "7:15"
+
+    def test_derive_scoped_to_region_matches_that_table_only(self):
+        # Region 0 body 7:15: Receipt on even rows (8,10,12,14=44),
+        # Return on odd rows (7,9,11,13,15=55) -> net -11.
+        result = asyncio.run(
+            query_engine.execute_derive(
+                "/ERP", "stmt.xlsx", "Two Tables", None, "Qty",
+                [
+                    {"conditions": {"Type": "Receipt"}, "sign": 1, "label": "receipts"},
+                    {"conditions": {"Type": "Return"}, "sign": -1, "label": "returns"},
+                ],
+                None, 0,
+            )
+        )
+        assert result["rows"] == [{"net": -11.0}]
+        assert result["region_used"]["body"] == "7:15"
 
 
 # --------------------------------------------------- structured conditions

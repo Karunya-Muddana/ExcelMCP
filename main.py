@@ -510,6 +510,19 @@ the column — use it to correct a near-miss and retry
 instead of concluding the data does not exist.
 At most {MAX_ROWS_RETURNED} rows are returned; check the
 truncated and total_matched fields in the response.
+
+region SCOPES TO ONE TABLE on a multi-region sheet (see
+multi_region_sheets / RULE 13). Pass either the region's
+index (0, 1, ...) or its body span as it appears in
+get_workspace_graph's regions list ("7:28"). Applied
+before conditions. Omit it on a single-region sheet — no
+effect there. Omit it on a multi-region sheet and the
+response carries region_warning naming every region and
+its span, because the result then spans all of them. An
+index out of range or a span matching no region is an
+error listing the real regions, never a silent fallback
+to the whole sheet. The region actually used comes back
+as region_used: {{index, body, row_count}} — cite it.
 """
 )
 async def filter_sheet(
@@ -520,17 +533,23 @@ async def filter_sheet(
     sort_by: Optional[str] = None,
     limit: Optional[int] = None,
     exact_case: bool = False,
+    region: Optional[Any] = None,
 ) -> dict:
     folder = _resolve_folder(folder_path)
     result = await execute_filter_sheet(
-        file_name, sheet, conditions, sort_by, limit, folder, exact_case
+        file_name, sheet, conditions, sort_by, limit, folder, exact_case, region
     )
     data = {
         "rows": result["rows"],
         "total_matched": result["total_matched"],
         "truncated": result["truncated"],
     }
-    for extra in ("zero_match_diagnostics", "structure_drift"):
+    for extra in (
+        "zero_match_diagnostics",
+        "structure_drift",
+        "region_used",
+        "region_warning",
+    ):
         if extra in result:
             data[extra] = result[extra]
     return wrap_response(
@@ -557,9 +576,16 @@ cross_file_aggregate instead — never use this tool
 and then manually add results across files.
 Get column names from get_workspace_graph first.
 If the sheet appears in multi_region_sheets, this tool
-will happily add up every region at once — restrict with
-conditions to the table you actually mean, or the total
-will be several unrelated tables stacked together.
+will happily add up every region at once — pass region
+(the region's index, e.g. 0, or its body span like
+"7:28" from get_workspace_graph's regions list) to
+restrict to the table you actually mean, applied before
+conditions and grouping. Omit region on a multi-region
+sheet and the response carries region_warning naming
+every region and its span, because the total then spans
+all of them; an unresolvable region raises rather than
+silently using the whole sheet. The region actually used
+comes back as region_used: {index, body, row_count}.
 Returns rows plus a truncated flag. If conditions
 matched zero rows, zero_match_diagnostics shows what
 each condition matched alone and the values actually
@@ -575,13 +601,20 @@ async def aggregate(
     folder_path: Optional[str] = None,
     conditions: Optional[dict] = None,
     having: Optional[dict] = None,
+    region: Optional[Any] = None,
 ) -> dict:
     folder = _resolve_folder(folder_path)
     result = await execute_aggregate(
-        file_name, sheet, group_by, value_col, operation, conditions, folder, having
+        file_name, sheet, group_by, value_col, operation, conditions, folder,
+        having, region,
     )
     data = {"rows": result["rows"], "truncated": result["truncated"]}
-    for extra in ("zero_match_diagnostics", "structure_drift"):
+    for extra in (
+        "zero_match_diagnostics",
+        "structure_drift",
+        "region_used",
+        "region_warning",
+    ):
         if extra in result:
             data[extra] = result[extra]
     return wrap_response(
@@ -756,27 +789,56 @@ The response includes a per-component breakdown with
 rows_matched. A component that matched ZERO rows is
 flagged and warned about — check the spelling of the
 transaction type before trusting the net.
+
+A component can use "base": true instead of "sign" — a
+one-off row like an opening balance, added with sign +1.
+It still needs "conditions" that match exactly that row
+(e.g. a blank transaction-type cell: {"Type": {"is_null":
+true}}), and it goes through the same zero-match
+flagging as any other component — check rows_matched is 1
+before trusting it.
+
+group_by is OPTIONAL. Omit it for one net total across
+every matching row (a single row with just "net" — no
+group key) — do not pass [] or a guessed column name to
+mean "no grouping". Give a column name or list of them
+only when you actually want the net broken out per group.
+
+region SCOPES TO ONE TABLE on a multi-region sheet — see
+filter_sheet's region parameter for the full contract
+(index or body span, applied before conditions and
+components, region_used/region_warning in the response).
+This is what turns "receipts minus returns across the
+whole sheet" into "net for Naphthalene" instead of
+Naphthalene and Oleum stacked together.
 """
 )
 async def derive(
     file_name: str,
     sheet: str,
-    group_by: Any,
     quantity_col: str,
     components: list,
+    group_by: Optional[Any] = None,
     folder_path: Optional[str] = None,
     conditions: Optional[dict] = None,
+    region: Optional[Any] = None,
 ) -> dict:
     folder = _resolve_folder(folder_path)
     result = await execute_derive(
-        folder, file_name, sheet, group_by, quantity_col, components, conditions
+        folder, file_name, sheet, group_by, quantity_col, components, conditions,
+        region,
     )
     data = {
         "rows": result["rows"],
         "components": result["components"],
         "truncated": result["truncated"],
     }
-    for extra in ("warning", "structure_drift"):
+    for extra in (
+        "warning",
+        "structure_drift",
+        "region_used",
+        "region_warning",
+    ):
         if result.get(extra):
             data[extra] = result[extra]
     return wrap_response(
