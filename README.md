@@ -216,6 +216,18 @@ cross_file_aggregate(
 
 ---
 
+## A practical workflow
+
+For reliable results, an agent should discover the workspace before querying it, then choose the tool that matches the question:
+
+1. **Orient:** Call `get_workspace_graph(folder_path="/ERP")` to discover the available workbooks, sheets, columns, and relationships. Do not guess names.
+2. **Find the answer:** Use `query` when the relevant sheet or column is not yet known. Use `lookup` when the question asks for one specific value and its source location.
+3. **Narrow or calculate:** Use `filter_sheet` to retrieve matching rows, `aggregate` to summarize one sheet, or `cross_file_aggregate` to calculate across workbooks. Use `join_sheets` when the answer depends on related sheets.
+4. **Check the result:** Preserve the returned file, sheet, and cell provenance where available. Check `truncated`, `total_matched`, and any `skipped_files` or `unmatched_files` before describing a result as complete.
+
+For example, a question such as “What is the contracted rate for Titanium Dioxide under the BESTEX contract?” is a single-value lookup, while “What is the total revenue by region across all workbooks?” calls for a cross-file aggregation. Choosing the matching tool keeps retrieval and calculation close to the source data instead of relying on assumptions or manual addition.
+
+
 ## Agent playbook
 
 Getting the server installed is the easy half. The [agents/](agents/) folder covers the other half: how to prompt an agent that has these tools, how to wire it into each host, and what to automate once it works.
